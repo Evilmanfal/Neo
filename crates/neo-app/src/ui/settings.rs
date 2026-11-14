@@ -45,7 +45,7 @@ impl NeoView {
         let device = panel()
             .gap(px(14.))
             .child(heading("This device"))
-            .child(field("Device name", "How this computer appears to others nearby."))
+            .child(field("Device name", "How this computer appears to your contacts and your other devices."))
             .child(input_row(self.name_input.clone(), "save-name", name_changed, cx))
             .child(divider())
             .child(field("Download folder", "Where received files are saved."))
@@ -104,7 +104,7 @@ impl NeoView {
         let mut people = panel().gap(px(10.)).child(heading("Contacts"));
         if self.contacts.is_empty() {
             people = people.child(
-                div().text_xs().text_color(rgb(MUTED)).child("No contacts yet. Click Add next to someone nearby, or use Add by code."),
+                div().text_xs().text_color(rgb(MUTED)).child("No contacts yet. Use Add by code with their code, or let them scan your QR code above."),
             );
         }
         for c in &self.contacts {
@@ -342,7 +342,7 @@ fn connection_status(r: &Reachability) -> impl IntoElement {
     } else if r.dht {
         (WARN, "Online, but your network hides this device; far-away contacts may not reach it.")
     } else {
-        (MUTED, "Connecting to the internet directory… (nearby devices work meanwhile)")
+        (MUTED, "Connecting to the internet directory… (contacts on this network work meanwhile)")
     };
     div()
         .flex()

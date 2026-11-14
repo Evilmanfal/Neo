@@ -6,7 +6,7 @@ use super::*;
 
 impl NeoView {
     pub(super) fn banners(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let mut out = Vec::new();
+        let mut out: Vec<AnyElement> = self.update_card(cx).into_iter().collect();
         if let Some(n) = self.notice.clone() {
             out.push(
                 banner(n, BAD, rgba(0xf2706d1f))
@@ -71,7 +71,7 @@ impl NeoView {
                     let id = *id;
                     request_card(
                         format!("{name} wants to add you as a contact"),
-                        format!("From {device_name} · code {}. Contacts can see when you're nearby and send you files.", account.code()),
+                        format!("From {device_name} · code {}. Contacts can see when you're online and send you files.", account.code()),
                     )
                     .child(answer_row(id, "Add contact", cx))
                 }

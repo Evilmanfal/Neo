@@ -56,6 +56,20 @@ fn parse_args() -> Args {
 
 fn main() {
     let args = parse_args();
+    if let Ok(exe) = std::env::current_exe() {
+        // Just updated: let the old copy finish quitting (it still holds the
+        // network port), then tidy up after it.
+        if std::env::args().any(|a| a == "--updated") {
+            let old = exe.with_file_name(format!("{}.old.exe", exe.file_stem().unwrap_or_default().to_string_lossy()));
+            for _ in 0..50 {
+                if std::fs::remove_file(&old).is_ok() || !old.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        neo_core::update::cleanup(&exe);
+    }
     let mut config = neo_core::Config::for_profile(args.profile.as_deref());
     if let Some(d) = &args.downloads {
         config.downloads = d.clone();

@@ -6,6 +6,7 @@
 
 mod backup;
 pub mod contacts;
+mod delta;
 pub mod discovery;
 pub mod gofile;
 pub mod identity;
@@ -16,7 +17,9 @@ pub mod proto;
 mod social;
 mod swarm;
 pub mod tls;
+pub mod update;
 mod transfer;
+mod wire;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -105,6 +108,10 @@ pub enum Event {
     /// A transfer was paused or resumed: `local` by you, `remote` by the
     /// other side (show "Paused by <their name>").
     Paused { id: TransferId, local: bool, remote: bool },
+    /// What crossed the network (this session): `raw` original bytes took
+    /// `wire` bytes thanks to compression and, if `delta`, by sending only
+    /// what changed. Emitted alongside progress when it changes.
+    Wire { id: TransferId, raw: u64, wire: u64, delta: bool },
     /// Bytes done so far (verified bytes on the receiving side), emitted at
     /// most ~8 times a second while active. Jumps ahead when a transfer resumes.
     Progress { id: TransferId, done: u64 },
@@ -120,6 +127,8 @@ pub enum Event {
     RequestClosed { id: u64 },
     /// How this device can be reached from the internet (changes rarely).
     Reachability(Reachability),
+    /// A newer Neo, and downloading it.
+    Update(update::UpdateEvent),
     /// Gofile tab updates (account, uploads, progress).
     Gofile(gofile::GofileEvent),
     /// A contact sent you a Gofile link.
@@ -155,6 +164,8 @@ pub enum Command {
     /// Gofile tab actions.
     Gofile(gofile::GofileCommand),
     ImportIdentity { path: PathBuf, passphrase: String },
+    /// Download and verify the newer release (see `Event::Update`).
+    DownloadUpdate,
     /// Test hook: closes every transfer connection as if the network had
     /// dropped (both sides then treat it as an interruption and resume).
     #[doc(hidden)]
@@ -218,6 +229,11 @@ pub struct Config {
     pub publish_lan: bool,
     /// Ask public STUN servers and the router (UPnP) about our public address.
     pub nat_traversal: bool,
+    /// Look for a newer Neo at start and every 12 hours (the app only).
+    pub check_updates: bool,
+    /// Tests and `neo-cli --discover-all` only: also announce readably and
+    /// list every Neo device on this network, contacts or not.
+    pub discover_all: bool,
 }
 
 impl Config {
@@ -251,6 +267,8 @@ impl Config {
             dht_bootstrap: None,
             publish_lan: true,
             nat_traversal: true,
+            check_updates: true,
+            discover_all: false,
         }
     }
 
@@ -364,6 +382,33 @@ pub(crate) struct Active {
     pub reported: u64,
     pub conn: Option<quinn::Connection>,
     pub cancelled: bool,
+    pub stats: Arc<WireStats>,
+    pub reported_wire: u64,
+}
+
+/// What actually crossed the network for a transfer (this session): original
+/// bytes moved, bytes on the wire for them, and whether delta applied.
+#[derive(Default)]
+pub(crate) struct WireStats {
+    pub raw: AtomicU64,
+    pub wire: AtomicU64,
+    pub delta: std::sync::atomic::AtomicBool,
+}
+
+impl WireStats {
+    pub fn add(&self, raw: u64, wire: u64) {
+        self.raw.fetch_add(raw, Ordering::Relaxed);
+        self.wire.fetch_add(wire, Ordering::Relaxed);
+    }
+
+    fn event(&self, id: TransferId) -> Event {
+        Event::Wire {
+            id,
+            raw: self.raw.load(Ordering::Relaxed),
+            wire: self.wire.load(Ordering::Relaxed),
+            delta: self.delta.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// An incoming transfer that lost its connection and can be resumed.
@@ -403,6 +448,14 @@ pub(crate) struct Shared {
     pub gofile: gofile::Gofile,
     /// Shared upload/download speed limits.
     pub limits: Arc<limit::Limits>,
+    /// When we last reached each device (skip the early knock if recent).
+    connected: Mutex<HashMap<DeviceId, Instant>>,
+    /// Codes being looked up right now (their LAN announcements are readable).
+    lan_lookups: Mutex<Vec<String>>,
+    /// The newest release seen (if newer than this build).
+    latest: Mutex<Option<update::Release>>,
+    /// Devices on an old Neo that we already told the user about.
+    told_legacy: Mutex<std::collections::HashSet<DeviceId>>,
     /// Pause state per transfer (kept across reconnects).
     gates: Mutex<HashMap<TransferId, Arc<limit::Gate>>>,
     next_id: AtomicU64,
@@ -434,7 +487,11 @@ impl Shared {
         let gofile = gofile::Gofile::load(&config.data_dir);
         let limits = Arc::new(limit::Limits::new(limit::to_rate(config.upload_limit), limit::to_rate(config.download_limit)));
         let presence = if config.internet {
-            net::presence::Presence::start(config.dht_bootstrap.as_deref()).ok().map(Arc::new)
+            let known: Vec<String> = std::fs::read(config.data_dir.join("dht_nodes.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            net::presence::Presence::start(config.dht_bootstrap.as_deref(), &known).ok().map(Arc::new)
         } else {
             None
         };
@@ -463,6 +520,10 @@ impl Shared {
             gofile,
             limits,
             gates: Mutex::new(HashMap::new()),
+            told_legacy: Mutex::new(Default::default()),
+            latest: Mutex::new(None),
+            lan_lookups: Mutex::new(Vec::new()),
+            connected: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         });
         let _ = shared.me.set(Arc::downgrade(&shared));
@@ -565,7 +626,42 @@ impl Shared {
     /// Connects to a device, trying all its known addresses at once (LAN,
     /// router-mapped, IPv6, public) and keeping the first that works.
     pub async fn connect_peer(&self, peer: &Peer) -> Result<quinn::Connection> {
+        let conn = self.connect_peer_any(peer).await?;
+        if tls::is_legacy(&conn) {
+            conn.close(transfer::FAILED, b"needs a newer Neo");
+            return Err(transfer::fatal(format!(
+                "{} has an older version of Neo. Ask them to update Neo, then try again.",
+                peer.name
+            )));
+        }
+        Ok(conn)
+    }
+
+    async fn connect_peer_any(&self, peer: &Peer) -> Result<quinn::Connection> {
+        let t0 = Instant::now();
+        let reach = self.reach.get();
+        let mut token = [0u8; 8];
+        let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut token);
+        // An internet peer we haven't reached lately: knock right away, in
+        // parallel with the first direct try (their router may drop us until
+        // they knock back). If the direct try wins, the knock cost nothing.
+        let recent = self.connected.lock().unwrap().get(&peer.id).is_some_and(|t| t.elapsed() < Duration::from_secs(600));
+        let knock = match (peer.remote && !recent, peer.account_key, self.presence.clone()) {
+            (true, Some(key), Some(presence)) => {
+                let (mine, nat) = (reach.candidates(self.config().publish_lan), reach.nat.clone());
+                Some(tokio::spawn(async move {
+                    let t = Instant::now();
+                    let r = presence.knock(&key, mine, Some(nat), Some(token)).await;
+                    debug(&format!("knock sent: {r:?} in {:?}", t.elapsed()));
+                }))
+            }
+            _ => None,
+        };
         let first = self.try_connect(peer).await;
+        debug(&format!("direct connect to {}: {} in {:?}", peer.name, if first.is_ok() { "ok" } else { "failed" }, t0.elapsed()));
+        if first.is_ok() {
+            self.connected.lock().unwrap().insert(peer.id, Instant::now());
+        }
         let (Err(err), true, Some(key), Some(presence)) = (&first, peer.remote, peer.account_key, self.presence.clone()) else {
             return first;
         };
@@ -574,11 +670,15 @@ impl Shared {
         // punch with the strategy both NAT types call for (`net/punch.rs`),
         // while plain retries keep going for the easy cases. No relay.
         debug(&format!("direct connect to {} failed ({err:#}); knocking and punching", peer.name));
-        let reach = self.reach.get();
         let mine = reach.candidates(self.config().publish_lan);
-        let mut token = [0u8; 8];
-        let _ = ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut token);
-        let _ = presence.knock(&key, mine, Some(reach.nat.clone()), Some(token)).await;
+        match knock {
+            Some(k) => {
+                let _ = k.await;
+            }
+            None => {
+                let _ = presence.knock(&key, mine, Some(reach.nat.clone()), Some(token)).await;
+            }
+        }
         let mut addrs = vec![peer.addr];
         addrs.extend(peer.alt.iter().copied());
         let plan = net::punch::plan(&reach.nat, &peer.nat.clone().unwrap_or_default(), &addrs, u64::from_le_bytes(token));
@@ -592,9 +692,13 @@ impl Shared {
             }
         };
         let found = tokio::select! {
-            c = retry => return Ok(c),
+            c = retry => {
+                self.connected.lock().unwrap().insert(peer.id, Instant::now());
+                return Ok(c);
+            }
             f = net::punch::run(&self.reach.socket, token, &plan, PUNCH_INITIATOR) => f,
         };
+        debug(&format!("punch finished after {:?}: {}", t0.elapsed(), found.is_some()));
         let cfg = tls::client_config(&self.identity, peer.id)?;
         let connect = match found {
             Some(net::punch::Found::Main(addr)) => {
@@ -687,6 +791,52 @@ impl Shared {
         Err(last.unwrap_or_else(|| anyhow!("no address worked")))
     }
 
+    /// Finds whoever has this code: on this network (their sealed announcement
+    /// becomes readable once we know the code) and over the internet at once,
+    /// taking whichever answers first.
+    async fn find_code(&self, typed: &str) -> Option<Peer> {
+        let typed = typed.trim();
+        let code = typed.rsplit_once("neo://add/").map(|(_, c)| c).unwrap_or(typed).to_string();
+        if let Some(p) = self.find_by_code(&code) {
+            return Some(p);
+        }
+        self.emit(Event::Info(format!("Looking for {code}…")));
+        self.lan_lookups.lock().unwrap().push(code.clone());
+        let lan = async {
+            // Announcements come every 2 s.
+            for _ in 0..25 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if let Some(p) = self.find_by_code(&code) {
+                    return Some(p);
+                }
+            }
+            None
+        };
+        let online = async {
+            match self.presence {
+                Some(_) => self.find_by_code_online(&code).await,
+                None => None,
+            }
+        };
+        let found = tokio::select! {
+            Some(p) = lan => Some(p),
+            Some(p) = online => Some(p),
+            else => None,
+        };
+        let found = found.or_else(|| self.find_by_code(&code));
+        self.lan_lookups.lock().unwrap().retain(|c| *c != code);
+        found
+    }
+
+    /// Keys for LAN announcements: ours (to seal) and everyone we may read.
+    fn lan_keys(&self) -> discovery::Me {
+        let mine = discovery::code_key(&self.my_account().code());
+        let mut readable = vec![mine];
+        readable.extend(self.contacts.lock().unwrap().iter().map(|c| discovery::code_key(&c.account.code())));
+        readable.extend(self.lan_lookups.lock().unwrap().iter().map(|c| discovery::code_key(c)));
+        discovery::Me { name: self.config.read().unwrap().name.clone(), attest: self.attest(), key: mine, readable }
+    }
+
     /// Finds the person with this code over the internet (DHT): resolves the
     /// code to their key, then their devices' current addresses.
     async fn find_by_code_online(&self, code: &str) -> Option<Peer> {
@@ -695,22 +845,70 @@ impl Shared {
         let typed = typed.rsplit_once("neo://add/").map(|(_, c)| c).unwrap_or(typed);
         let t0 = Instant::now();
         // DHT writes take a moment to spread; try a few times.
-        let mut public = None;
+        let mut resolved = None;
         for attempt in 0..3 {
-            public = presence.resolve_code(typed).await;
-            debug(&format!("resolve {typed} (try {attempt}): {} in {:?}", public.is_some(), t0.elapsed()));
-            if public.is_some() {
+            resolved = presence.resolve_code(typed, PRESENCE_FRESH).await;
+            debug(&format!("resolve {typed} (try {attempt}): {} in {:?}", resolved.is_some(), t0.elapsed()));
+            if resolved.is_some() {
                 break;
             }
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        let public = public?;
+        let (public, devices) = resolved?;
+        // Since 0.2 the code record also says where their devices are.
+        let found = devices.into_iter().filter(|e| e.id != self.identity.id).find_map(|e| remote_peer(e, public));
+        if found.is_some() {
+            debug(&format!("code record listed their devices: found in {:?}", t0.elapsed()));
+            return found;
+        }
         let entries = presence.lookup(&public, PRESENCE_FRESH).await;
         debug(&format!("lookup: {entries:?} in {:?}", t0.elapsed()));
         entries.into_iter().filter(|e| e.id != self.identity.id).find_map(|e| remote_peer(e, public))
     }
 
     // ------------------------------------------------------------- internet
+
+    /// Looks for a newer release shortly after start, then every 12 hours.
+    /// Failures stay silent; a release already announced isn't repeated.
+    async fn update_loop(self: Arc<Self>) {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        loop {
+            match update::check(&update::endpoint()).await {
+                Ok(Some(rel)) => {
+                    let new = self.latest.lock().unwrap().replace(rel.clone()).is_none_or(|old| old != rel);
+                    if new {
+                        self.emit(Event::Update(update::UpdateEvent::Available(rel)));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => debug(&format!("update check: {e:#}")),
+            }
+            tokio::time::sleep(update::EVERY).await;
+        }
+    }
+
+    fn download_update(self: Arc<Self>) {
+        let Some(rel) = self.latest.lock().unwrap().clone() else { return };
+        tokio::spawn(async move {
+            let exe = match std::env::current_exe() {
+                Ok(e) => e,
+                Err(e) => return self.emit(Event::Update(update::UpdateEvent::Failed(e.to_string()))),
+            };
+            let last = Mutex::new(Instant::now() - Duration::from_secs(1));
+            let progress = |done: u64, total: u64| {
+                let mut last = last.lock().unwrap();
+                if last.elapsed() >= Duration::from_millis(150) || done == total {
+                    *last = Instant::now();
+                    self.emit(Event::Update(update::UpdateEvent::Progress { done, total }));
+                }
+            };
+            let ev = match update::download(&rel, &exe, &update::release_key(), progress).await {
+                Ok(path) => update::UpdateEvent::Ready(path),
+                Err(e) => update::UpdateEvent::Failed(format!("{e:#}")),
+            };
+            self.emit(Event::Update(ev));
+        });
+    }
 
     /// Keeps reachability fresh: interfaces every minute, STUN every 5
     /// minutes, the router mapping every 30 (its lease is an hour).
@@ -739,14 +937,16 @@ impl Shared {
     /// Publishes where this device can be reached, every 5 minutes or when
     /// that changes, plus the code record every 30 minutes.
     async fn publish_loop(self: Arc<Self>, presence: Arc<net::presence::Presence>) {
+        let t_boot = Instant::now();
         while !presence.ready().await {
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
+        debug(&format!("DHT bootstrapped in {:?}", t_boot.elapsed()));
         if self.reach.set_dht(true) {
             self.emit(Event::Reachability(self.reach.get()));
         }
         self.wake_lookup.notify_one();
-        let mut last_code: Option<Instant> = None;
+        let mut saved_nodes = false;
         loop {
             let cfg = self.config();
             let addrs = self.reach.get().candidates(cfg.publish_lan);
@@ -761,16 +961,24 @@ impl Shared {
                     nat: (nat.kind != net::nat::NatKind::Unknown).then_some(nat),
                 };
                 let t0 = Instant::now();
-                // The code record first: it's what lets people add you by code.
-                if last_code.is_none_or(|t| t.elapsed() > Duration::from_secs(1800)) {
-                    let r = presence.publish_code(&account).await;
-                    debug(&format!("publish code {}: {r:?} in {:?}", account.id().code(), t0.elapsed()));
-                    if r.is_ok() {
-                        last_code = Some(Instant::now());
+                // The code record first, so people can add you by code at
+                // once; it then gets the device list from presence, so one
+                // lookup by code finds both who and where.
+                let early = presence.publish_code(&account, std::slice::from_ref(&me)).await;
+                debug(&format!("publish code {}: {early:?} in {:?} ({:?} since start)", account.id().code(), t0.elapsed(), t_boot.elapsed()));
+                let r = presence.publish(&account, me).await;
+                debug(&format!("publish presence: {:?} in {:?}", r.as_ref().map(|d| d.len()), t0.elapsed()));
+                if let Some(devices) = r.ok().filter(|d| d.len() > 1) {
+                    let r = presence.publish_code(&account, &devices).await;
+                    debug(&format!("publish code with {} devices: {r:?}", devices.len()));
+                }
+                if !saved_nodes && cfg.dht_bootstrap.is_none() {
+                    let nodes = presence.known_nodes().await;
+                    if nodes.len() >= 8 {
+                        let _ = std::fs::write(cfg.data_dir.join("dht_nodes.json"), serde_json::to_vec(&nodes).unwrap_or_default());
+                        saved_nodes = true;
                     }
                 }
-                let r = presence.publish(&account, me).await;
-                debug(&format!("publish presence: {r:?} in {:?}", t0.elapsed()));
             }
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {}
@@ -782,14 +990,20 @@ impl Shared {
     /// Looks up contacts (and your other devices) in the DHT every 90 s, or
     /// when contacts change.
     async fn lookup_loop(self: Arc<Self>, presence: Arc<net::presence::Presence>) {
+        // Right after contacts change (someone just added), their record may
+        // not be up yet: look again every 10 s for two minutes.
+        let mut changed = Instant::now() - Duration::from_secs(3600);
+        let mut missing = false;
         loop {
+            let wait = if missing && changed.elapsed() < Duration::from_secs(120) { 10 } else { 90 };
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(90)) => {}
-                _ = self.wake_lookup.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
+                _ = self.wake_lookup.notified() => changed = Instant::now(),
             }
             if !self.reach.get().dht {
                 continue;
             }
+            debug("contact lookup starts");
             let mut keys: Vec<[u8; 32]> = self
                 .contacts
                 .lock()
@@ -807,6 +1021,13 @@ impl Shared {
             while let Some(Ok((key, entries))) = set.join_next().await {
                 found.extend(entries.into_iter().filter(|e| e.id != self.identity.id).filter_map(|e| remote_peer(e, key)));
             }
+            missing = self
+                .contacts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| !found.iter().any(|p: &Peer| p.account == Some(c.account)));
+            debug(&format!("contact lookup: {} devices online", found.len()));
             *self.remote_peers.lock().unwrap() = found;
             self.merge_peers();
         }
@@ -843,8 +1064,12 @@ impl Shared {
     /// them for 90 s and joins their punch session.
     async fn knock_loop(self: Arc<Self>, presence: Arc<net::presence::Presence>) {
         let mut seen = 0u64;
+        let started = Instant::now();
         loop {
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            // Someone adding you usually does it soon after you open Neo: look
+            // often at first, then every few seconds (one small DHT read).
+            let every = if started.elapsed() < Duration::from_secs(180) { 2 } else { 5 };
+            tokio::time::sleep(Duration::from_secs(every)).await;
             if !self.reach.get().dht {
                 continue;
             }
@@ -931,7 +1156,17 @@ impl Shared {
                 a.reported = done;
                 self.emit(Event::Progress { id, done });
             }
+            let wire = a.stats.wire.load(Ordering::Relaxed);
+            if wire != a.reported_wire {
+                a.reported_wire = wire;
+                self.emit(a.stats.event(id));
+            }
         }
+    }
+
+    /// The wire counters of a registered transfer.
+    pub(crate) fn stats(&self, id: TransferId) -> Arc<WireStats> {
+        self.active.lock().unwrap().get(&id).map(|a| a.stats.clone()).unwrap_or_default()
     }
 
     /// Registers a transfer for progress reporting and returns its byte
@@ -940,7 +1175,8 @@ impl Shared {
     pub fn register(&self, info: TransferInfo, announce: bool) -> Arc<AtomicU64> {
         let progress = Arc::new(AtomicU64::new(0));
         let id = info.id;
-        self.active.lock().unwrap().insert(id, Active { progress: progress.clone(), reported: u64::MAX, conn: None, cancelled: false });
+        let active = Active { progress: progress.clone(), reported: u64::MAX, conn: None, cancelled: false, stats: Arc::default(), reported_wire: 0 };
+        self.active.lock().unwrap().insert(id, active);
         if announce {
             self.emit(Event::Transfer(info));
         }
@@ -1043,6 +1279,9 @@ impl Shared {
                 tokio::spawn(self.clone().lookup_loop(presence));
             }
         }
+        if self.config().check_updates {
+            tokio::spawn(self.clone().update_loop());
+        }
 
         // LAN discovery.
         let s = self.clone();
@@ -1052,13 +1291,8 @@ impl Shared {
                 return;
             }
             let (s1, s2) = (s.clone(), s.clone());
-            let result = discovery::run(
-                s.identity.id,
-                move || (s1.config.read().unwrap().name.clone(), s1.attest()),
-                port,
-                move |peers| s2.set_lan_peers(peers),
-            )
-            .await;
+            let open = s.config().discover_all;
+            let result = discovery::run(s.identity.id, move || s1.lan_keys(), port, open, move |peers| s2.set_lan_peers(peers)).await;
             if let Err(e) = result {
                 s.emit(Event::Notice(format!("Local discovery unavailable: {e}")));
             }
@@ -1080,6 +1314,11 @@ impl Shared {
                     if done != a.reported {
                         a.reported = done;
                         updates.push(Event::Progress { id: *id, done });
+                    }
+                    let wire = a.stats.wire.load(Ordering::Relaxed);
+                    if wire != a.reported_wire {
+                        a.reported_wire = wire;
+                        updates.push(a.stats.event(*id));
                     }
                 }
                 for u in updates {
@@ -1114,6 +1353,7 @@ impl Shared {
             }
             Command::Cancel { id } => self.cancel(id),
             Command::Pause { id, paused } => self.pause(id, paused),
+            Command::DownloadUpdate => self.download_update(),
             Command::DropConnections => {
                 let conns: Vec<quinn::Connection> = self.active.lock().unwrap().values().filter_map(|a| a.conn.clone()).collect();
                 for c in conns {
@@ -1156,54 +1396,34 @@ impl Shared {
                     None => self.emit(Event::Notice("That device isn't nearby anymore".into())),
                 }
             }
-            Command::AddByCode { code } => match self.find_by_code(&code) {
-                Some(peer) => {
-                    tokio::spawn(async move { social::request_pair(self, peer).await });
-                }
-                None if self.presence.is_some() => {
-                    self.emit(Event::Info(format!("Looking for {} over the internet…", code.trim())));
-                    tokio::spawn(async move {
-                        match self.find_by_code_online(&code).await {
-                            Some(peer) => social::request_pair(self, peer).await,
-                            None => self.emit(Event::Notice(format!(
-                                "Couldn't find {} nearby or online. They need Neo open; check the code.",
-                                code.trim()
-                            ))),
-                        }
-                    });
-                }
-                None => self.emit(Event::Notice(format!(
-                    "No one with code {} is nearby. They need Neo open on this network.",
-                    code.trim()
-                ))),
-            },
+            Command::AddByCode { code } => {
+                tokio::spawn(async move {
+                    match self.find_code(&code).await {
+                        Some(peer) => social::request_pair(self, peer).await,
+                        None => self.emit(Event::Notice(format!(
+                            "Couldn't find {}. They need Neo open; check the code.",
+                            code.trim()
+                        ))),
+                    }
+                });
+            }
             Command::RemoveContact { account } => self.update_contacts(|c| c.retain(|x| x.account != account)),
             Command::SetAutoAccept { account, on } => self.update_contacts(|c| {
                 if let Some(x) = c.iter_mut().find(|x| x.account == account) {
                     x.auto_accept = on;
                 }
             }),
-            Command::LinkWith { code } => match self.find_by_code(&code) {
-                Some(peer) => {
-                    tokio::spawn(async move { social::request_link(self, peer).await });
-                }
-                None if self.presence.is_some() => {
-                    self.emit(Event::Info(format!("Looking for {} over the internet…", code.trim())));
-                    tokio::spawn(async move {
-                        match self.find_by_code_online(&code).await {
-                            Some(peer) => social::request_link(self, peer).await,
-                            None => self.emit(Event::Notice(format!(
-                                "Couldn't find a device with code {} nearby or online. Open Neo on it.",
-                                code.trim()
-                            ))),
-                        }
-                    });
-                }
-                None => self.emit(Event::Notice(format!(
-                    "No device with code {} is nearby. Open Neo on it, on this network.",
-                    code.trim()
-                ))),
-            },
+            Command::LinkWith { code } => {
+                tokio::spawn(async move {
+                    match self.find_code(&code).await {
+                        Some(peer) => social::request_link(self, peer).await,
+                        None => self.emit(Event::Notice(format!(
+                            "Couldn't find a device with code {}. Open Neo on it and check the code.",
+                            code.trim()
+                        ))),
+                    }
+                });
+            }
             Command::Gofile(cmd) => {
                 tokio::spawn(gofile::handle(self, cmd));
             }
@@ -1247,6 +1467,15 @@ impl Shared {
 async fn route(shared: Arc<Shared>, incoming: quinn::Incoming) {
     let Ok(conn) = incoming.await else { return };
     let Some(peer_id) = tls::peer_id(&conn) else { return };
+    if tls::is_legacy(&conn) {
+        // Neo 0.1 shows this reason as the failure.
+        conn.close(transfer::FAILED, b"The other device has a newer version of Neo. Update Neo on this computer to reach it.");
+        if shared.told_legacy.lock().unwrap().insert(peer_id) {
+            let name = shared.peer(peer_id).map(|p| p.name).unwrap_or_else(|| peer_id.code());
+            shared.emit(Event::Notice(format!("{name} has an older version of Neo and can't connect. They need to update Neo.")));
+        }
+        return;
+    }
     let Ok((ctl_tx, mut ctl_rx)) = conn.accept_bi().await else { return };
     let Ok(first) = proto::read_frame::<proto::Msg>(&mut ctl_rx).await else { return };
     match first {

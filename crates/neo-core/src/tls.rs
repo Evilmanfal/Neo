@@ -21,16 +21,44 @@ use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
 use crate::identity::{DeviceId, Identity};
 
-pub const ALPN: &[u8] = b"neo/5";
+pub const ALPN: &[u8] = b"neo/6";
+/// What Neo 0.1 speaks. Still negotiated, only so either side can say
+/// "update Neo" instead of failing the handshake with a cryptic error.
+pub const LEGACY_ALPN: &[u8] = b"neo/5";
 pub const SERVER_NAME: &str = "neo";
 
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// Congestion control. BBR by default (holds its rate on lossy and long
+/// paths where loss-based Cubic backs off); `NEO_CC=cubic` switches back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cc {
+    Bbr,
+    Cubic,
+}
+
+impl Cc {
+    pub fn from_env() -> Cc {
+        match std::env::var("NEO_CC").map(|v| v.to_ascii_lowercase()) {
+            Ok(v) if v == "cubic" => Cc::Cubic,
+            _ => Cc::Bbr,
+        }
+    }
+}
+
 /// Flow-control windows sized for LAN speeds while capping per-transfer memory.
 pub fn transport() -> Arc<TransportConfig> {
+    transport_for(Cc::from_env())
+}
+
+pub fn transport_for(cc: Cc) -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
+    match cc {
+        Cc::Bbr => t.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default())),
+        Cc::Cubic => t.congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
+    };
     t.stream_receive_window(VarInt::from_u32(8 << 20));
     t.receive_window(VarInt::from_u32(24 << 20));
     t.send_window(24 << 20);
@@ -42,12 +70,18 @@ pub fn transport() -> Arc<TransportConfig> {
 }
 
 pub fn server_config(identity: &Identity) -> Result<quinn::ServerConfig> {
+    server_config_alpn(identity, &[ALPN, LEGACY_ALPN])
+}
+
+/// Test hook: a server speaking only these protocols (e.g. like Neo 0.1).
+#[doc(hidden)]
+pub fn server_config_alpn(identity: &Identity, alpn: &[&[u8]]) -> Result<quinn::ServerConfig> {
     let provider = provider();
     let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(Arc::new(AnyIdentity(provider)))
         .with_single_cert(vec![identity.cert.clone()], identity.key())?;
-    tls.alpn_protocols = vec![ALPN.to_vec()];
+    tls.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
     let mut cfg = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     cfg.transport_config(transport());
     Ok(cfg)
@@ -55,16 +89,30 @@ pub fn server_config(identity: &Identity) -> Result<quinn::ServerConfig> {
 
 /// Client config that only accepts a server whose certificate hashes to `expected`.
 pub fn client_config(identity: &Identity, expected: DeviceId) -> Result<quinn::ClientConfig> {
+    client_config_alpn(identity, expected, &[ALPN, LEGACY_ALPN])
+}
+
+/// Test hook: a client offering only these protocols (e.g. like Neo 0.1).
+#[doc(hidden)]
+pub fn client_config_alpn(identity: &Identity, expected: DeviceId, alpn: &[&[u8]]) -> Result<quinn::ClientConfig> {
     let provider = provider();
     let mut tls = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(Pinned { expected, provider }))
         .with_client_auth_cert(vec![identity.cert.clone()], identity.key())?;
-    tls.alpn_protocols = vec![ALPN.to_vec()];
+    tls.alpn_protocols = alpn.iter().map(|a| a.to_vec()).collect();
     let mut cfg = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
     cfg.transport_config(transport());
     Ok(cfg)
+}
+
+/// True if the other side only speaks an older Neo protocol.
+pub fn is_legacy(conn: &quinn::Connection) -> bool {
+    conn.handshake_data()
+        .and_then(|h| h.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|h| h.protocol)
+        .is_some_and(|p| p != ALPN)
 }
 
 /// The DeviceId of whoever is on the other end of an established connection.

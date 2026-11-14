@@ -9,10 +9,19 @@
 //! - **Code record**: maps a 12-character code to the full account key, so
 //!   "Add by code" works over the internet too. It is stored under a key
 //!   derived from the code itself. Anyone with the code could overwrite it,
-//!   but not forge it: the answer must hash to the code (60 bits).
+//!   but not forge it: the answer must hash to the code (60 bits). Since
+//!   0.2 it also carries the sealed device list (the same as presence), so
+//!   one lookup finds both who and where; anyone with the code could read
+//!   the presence record anyway.
+//! - **Speed:** reads take the first valid answer from the DHT's streaming
+//!   lookup (waiting at most ~0.5 s more for a newer one) instead of waiting
+//!   for the whole traversal, and good DHT nodes are remembered between runs
+//!   to bootstrap faster.
 
 use std::net::SocketAddr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use futures_util::StreamExt;
 
 use anyhow::{anyhow, Result};
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -104,13 +113,41 @@ pub struct Presence {
     dht: AsyncDht,
 }
 
+/// After the first valid answer, how long to wait for a newer one.
+const SETTLE: Duration = Duration::from_millis(500);
+/// Give up on a lookup after this long.
+const LOOKUP_MAX: Duration = Duration::from_secs(20);
+
+/// Takes the first answer `ok` accepts, then up to `settle` more for one with
+/// a higher seq. Ends early when the DHT has nothing more to say.
+async fn first(items: impl futures_util::Stream<Item = MutableItem> + Unpin, settle: Duration, ok: impl Fn(&MutableItem) -> bool) -> Option<MutableItem> {
+    let mut items = items;
+    let deadline = tokio::time::Instant::now() + LOOKUP_MAX;
+    let mut best: Option<MutableItem> = None;
+    let mut until = deadline;
+    while let Ok(Some(item)) = tokio::time::timeout_at(until, items.next()).await {
+        if !ok(&item) {
+            continue;
+        }
+        if best.as_ref().is_none_or(|b| item.seq() > b.seq()) {
+            if best.is_none() {
+                until = (tokio::time::Instant::now() + settle).min(deadline);
+            }
+            best = Some(item);
+        }
+    }
+    best
+}
+
 impl Presence {
     /// Joins the public DHT, or with `bootstrap` a local test network
-    /// (which runs on localhost).
-    pub fn start(bootstrap: Option<&[String]>) -> Result<Self> {
+    /// (which runs on localhost). `known` are nodes remembered from last time.
+    pub fn start(bootstrap: Option<&[String]>, known: &[String]) -> Result<Self> {
         let mut builder = mainline::Dht::builder();
         if let Some(nodes) = bootstrap {
             builder.bootstrap(nodes).bind_address(std::net::Ipv4Addr::LOCALHOST);
+        } else if !known.is_empty() {
+            builder.extra_bootstrap(known);
         }
         Ok(Presence { dht: builder.build()?.as_async() })
     }
@@ -119,19 +156,23 @@ impl Presence {
         self.dht.bootstrapped().await
     }
 
+    /// Good nodes to start from next time.
+    pub async fn known_nodes(&self) -> Vec<String> {
+        self.dht.to_bootstrap().await
+    }
+
     async fn read(&self, public: &[u8; 32]) -> (Option<i64>, Record) {
-        match self.dht.get_mutable_most_recent(public, Some(PRESENCE_SALT)).await {
-            Some(item) => {
-                let record = open(public, item.value()).and_then(|p| serde_json::from_slice(&p).ok()).unwrap_or_default();
-                (Some(item.seq()), record)
-            }
+        let items = self.dht.get_mutable(public, Some(PRESENCE_SALT), None);
+        let parse = |item: &MutableItem| open(public, item.value()).and_then(|p| serde_json::from_slice::<Record>(&p).ok());
+        match first(items, SETTLE, |i| parse(i).is_some()).await {
+            Some(item) => (Some(item.seq()), parse(&item).unwrap_or_default()),
             None => (None, Record::default()),
         }
     }
 
     /// Adds/refreshes this device in its owner's record (linked devices
-    /// share one record and merge into it).
-    pub async fn publish(&self, account: &Account, me: DeviceEntry) -> Result<()> {
+    /// share one record and merge into it). Returns the devices written.
+    pub async fn publish(&self, account: &Account, me: DeviceEntry) -> Result<Vec<DeviceEntry>> {
         let public = account.public();
         let seed = account.seed().ok_or_else(|| anyhow!("account key can't sign DHT records"))?;
         for _attempt in 0..3 {
@@ -149,7 +190,7 @@ impl Presence {
             let next = seq.map(|s| s + 1).unwrap_or(0).max(now() as i64);
             let item = MutableItem::new(SigningKey::from_bytes(&seed), &value, next, Some(PRESENCE_SALT));
             match self.dht.put_mutable(item, seq).await {
-                Ok(_) => return Ok(()),
+                Ok(_) => return Ok(record.d),
                 Err(mainline::errors::PutMutableError::Concurrency(_)) => continue, // someone else wrote; merge again
                 Err(e) => return Err(anyhow!("{e}")),
             }
@@ -164,9 +205,22 @@ impl Presence {
         record.d.into_iter().filter(|d| d.t >= cutoff).collect()
     }
 
-    /// Lets people resolve your code to your account key.
-    pub async fn publish_code(&self, account: &Account) -> Result<()> {
-        let item = MutableItem::new(code_signer(&account.id().code()), &account.public(), now() as i64, None);
+    /// Lets people resolve your code to your account key and, in the same
+    /// answer, your devices' addresses (sealed like presence).
+    pub async fn publish_code(&self, account: &Account, devices: &[DeviceEntry]) -> Result<()> {
+        let public = account.public();
+        let mut record = Record { d: devices.to_vec() };
+        let value = loop {
+            let mut v = public.to_vec();
+            if !record.d.is_empty() {
+                v.extend(seal(&public, &serde_json::to_vec(&record)?)?);
+            }
+            if v.len() <= MAX_VALUE || record.d.is_empty() {
+                break v;
+            }
+            record.d.pop();
+        };
+        let item = MutableItem::new(code_signer(&account.id().code()), &value, now() as i64, None);
         self.dht.put_mutable(item, None).await.map_err(|e| anyhow!("{e}"))?;
         Ok(())
     }
@@ -189,17 +243,37 @@ impl Presence {
     /// The latest knock for us, if it's recent.
     pub async fn knocks(&self, my_public: &[u8; 32], fresh: Duration) -> Option<Knock> {
         let signer = knock_signer(my_public);
-        let item = self.dht.get_mutable_most_recent(signer.verifying_key().as_bytes(), Some(KNOCK_SALT)).await?;
-        let knock: Knock = serde_json::from_slice(&open(my_public, item.value())?).ok()?;
-        (knock.t + fresh.as_secs() >= now()).then_some(knock)
+        let parse = |item: &MutableItem| -> Option<Knock> {
+            let k: Knock = serde_json::from_slice(&open(my_public, item.value())?).ok()?;
+            (k.t + fresh.as_secs() >= now()).then_some(k)
+        };
+        let items = self.dht.get_mutable(signer.verifying_key().as_bytes(), Some(KNOCK_SALT), None);
+        let item = first(items, SETTLE, |i| parse(i).is_some()).await?;
+        parse(&item)
     }
 
-    /// The account key behind a code, verified against the code.
-    pub async fn resolve_code(&self, code: &str) -> Option<[u8; 32]> {
+    /// The account key behind a code, verified against the code, plus the
+    /// devices it lists (records from Neo 0.2 on), updated within `fresh`.
+    pub async fn resolve_code(&self, code: &str, fresh: Duration) -> Option<([u8; 32], Vec<DeviceEntry>)> {
         let signer = code_signer(code);
-        let item = self.dht.get_mutable_most_recent(signer.verifying_key().as_bytes(), None).await?;
-        let public: [u8; 32] = item.value().try_into().ok()?;
-        AccountId::of_public(&public).matches_code(code).then_some(public)
+        let parse = |item: &MutableItem| -> Option<([u8; 32], Vec<DeviceEntry>)> {
+            let v = item.value();
+            let public: [u8; 32] = v.get(..32)?.try_into().ok()?;
+            if !AccountId::of_public(&public).matches_code(code) {
+                return None; // someone overwrote it with a key that isn't theirs to claim
+            }
+            let cutoff = now().saturating_sub(fresh.as_secs());
+            let devices = open(&public, &v[32..])
+                .and_then(|p| serde_json::from_slice::<Record>(&p).ok())
+                .map(|r| r.d.into_iter().filter(|d| d.t >= cutoff).collect())
+                .unwrap_or_default();
+            Some((public, devices))
+        };
+        let t = Instant::now();
+        let items = self.dht.get_mutable(signer.verifying_key().as_bytes(), None, None);
+        let item = first(items, SETTLE, |i| parse(i).is_some()).await;
+        crate::debug(&format!("resolve {code}: {} in {:?}", item.is_some(), t.elapsed()));
+        parse(&item?)
     }
 }
 
@@ -219,8 +293,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn publish_lookup_and_codes_on_a_test_dht() {
         let testnet = mainline::Testnet::builder(10).build().unwrap();
-        let alice = Presence::start(Some(&testnet.bootstrap)).unwrap();
-        let bob = Presence::start(Some(&testnet.bootstrap)).unwrap();
+        let alice = Presence::start(Some(&testnet.bootstrap), &[]).unwrap();
+        let bob = Presence::start(Some(&testnet.bootstrap), &[]).unwrap();
         assert!(alice.ready().await && bob.ready().await);
         let account = Account::generate().unwrap();
         let laptop = DeviceEntry { id: DeviceId([1; 32]), name: "Laptop".into(), addrs: vec!["203.0.113.7:4000".parse().unwrap()], t: now(), nat: None };
@@ -235,8 +309,10 @@ mod tests {
         bob.knock(&account.public(), knock_from.clone(), None, Some([7; 8])).await.unwrap();
         assert_eq!(alice.knocks(&account.public(), Duration::from_secs(60)).await.map(|k| k.addrs), Some(knock_from));
 
-        alice.publish_code(&account).await.unwrap();
-        assert_eq!(bob.resolve_code(&account.id().code()).await, Some(account.public()));
-        assert_eq!(bob.resolve_code("0000-0000-0000").await, None);
+        alice.publish_code(&account, &found).await.unwrap();
+        let (public, devices) = bob.resolve_code(&account.id().code(), Duration::from_secs(600)).await.unwrap();
+        assert_eq!(public, account.public());
+        assert_eq!(devices.len(), 2, "one lookup gives the devices too");
+        assert_eq!(bob.resolve_code("0000-0000-0000", Duration::from_secs(600)).await, None);
     }
 }

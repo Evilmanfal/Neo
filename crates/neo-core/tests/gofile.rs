@@ -170,6 +170,8 @@ fn node(root: &Path, name: &str) -> NodeHandle {
         dht_bootstrap: None,
         publish_lan: false,
         nat_traversal: false,
+        check_updates: false,
+        discover_all: true,
     })
     .unwrap()
 }

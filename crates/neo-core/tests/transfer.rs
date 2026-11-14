@@ -33,6 +33,8 @@ fn node_with(root: &Path, name: &str, auto_accept: bool) -> NodeHandle {
         dht_bootstrap: None,
         publish_lan: true,
         nat_traversal: false,
+        check_updates: false,
+        discover_all: true,
     })
     .unwrap()
 }
@@ -275,6 +277,8 @@ fn internet_only(root: &Path, name: &str, bootstrap: &[String]) -> NodeHandle {
         dht_bootstrap: Some(bootstrap.to_vec()),
         publish_lan: true,
         nat_traversal: false,
+        check_updates: false,
+        discover_all: true,
     })
     .unwrap()
 }

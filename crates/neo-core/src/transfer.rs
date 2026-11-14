@@ -25,10 +25,12 @@ use quinn::VarInt;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
+use crate::delta::{self, BaseFile, Hash16};
 use crate::limit::{self, Gate, Limits};
+use crate::wire::{self, Decoder, Encoder, Seg, PIECES, RAW};
 use crate::partial;
 use crate::proto::{read_frame, sanitize_rel_path, write_frame, FileMeta, Msg, BLOCK};
-use crate::{Direction, Interrupted, Peer, Shared, TransferInfo, TransferState};
+use crate::{Direction, Interrupted, Peer, Shared, TransferInfo, TransferState, WireStats};
 
 pub const CANCELLED: VarInt = VarInt::from_u32(1);
 pub(crate) const DONE: VarInt = VarInt::from_u32(0);
@@ -58,6 +60,23 @@ impl fmt::Display for Fatal {
 
 impl std::error::Error for Fatal {}
 
+/// The receiver's old copy of a file didn't match its chunk index (edited
+/// without its timestamp changing). The index is dropped and the transfer
+/// reconnects; the file then continues without delta.
+#[derive(Debug)]
+pub(crate) struct BaseChanged;
+
+impl fmt::Display for BaseChanged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the old copy changed")
+    }
+}
+
+impl std::error::Error for BaseChanged {}
+
+/// Close code asking the sender to reconnect right away (see `BaseChanged`).
+pub(crate) const RETRY: VarInt = VarInt::from_u32(6);
+
 pub(crate) fn fatal(msg: impl Into<String>) -> anyhow::Error {
     Fatal(msg.into()).into()
 }
@@ -72,6 +91,9 @@ pub(crate) fn classify(e: &anyhow::Error) -> Outcome {
     for c in e.chain() {
         if let Some(f) = c.downcast_ref::<Fatal>() {
             return Outcome::Failed(f.0.clone());
+        }
+        if c.is::<BaseChanged>() {
+            return Outcome::Retry("The old copy changed; continuing without it".into());
         }
         let ce = if let Some(x) = c.downcast_ref::<quinn::ConnectionError>() {
             Some(x)
@@ -343,10 +365,10 @@ async fn send_attempt(
     if !*accepted {
         shared.set_state(id, TransferState::Waiting);
     }
-    let (offsets, have) = match read_frame::<Msg>(&mut ctl_rx).await? {
-        Msg::Decision { accept: true, offsets, have, paused } => {
+    let (offsets, have, bases) = match read_frame::<Msg>(&mut ctl_rx).await? {
+        Msg::Decision { accept: true, offsets, have, paused, bases } => {
             shared.set_remote_pause(id, paused);
-            (offsets, have)
+            (offsets, have, bases)
         }
         Msg::Decision { accept: false, .. } => {
             conn.close(DONE, b"declined");
@@ -369,19 +391,22 @@ async fn send_attempt(
             bail!("recipient asked for an invalid resume point");
         }
         already += start;
-        todo.push((i as u32, path.clone(), meta.size, start));
+        // Their old version's chunks, if they have one (whole files only).
+        let known = bases.get(i).filter(|_| start == 0).and_then(|b| delta::from_wire(b)).map(Arc::new);
+        todo.push(SendFile { index: i as u32, path: path.clone(), name: meta.name.clone(), size: meta.size, start, known });
     }
     progress.store(already, Ordering::Relaxed);
     shared.set_state(id, TransferState::Active);
 
     let permits = Arc::new(tokio::sync::Semaphore::new(PARALLEL_FILES));
+    let stats = shared.stats(id);
     let mut set = JoinSet::new();
-    for (index, path, size, start) in todo {
+    for f in todo {
         let (conn, progress, permits) = (conn.clone(), progress.clone(), permits.clone());
-        let (gate, limits) = (gate.clone(), shared.limits.clone());
+        let (gate, limits, stats) = (gate.clone(), shared.limits.clone(), stats.clone());
         set.spawn(async move {
             let _permit = permits.acquire_owned().await?;
-            send_file(&conn, index, &path, size, start, &progress, &gate, &limits).await
+            send_file(&conn, f, &progress, &gate, &limits, &stats).await
         });
     }
     let files_done = async {
@@ -407,55 +432,110 @@ async fn send_attempt(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn send_file(
-    conn: &quinn::Connection,
+/// One file still to send.
+struct SendFile {
     index: u32,
-    path: &Path,
+    path: PathBuf,
+    name: String,
     size: u64,
     start: u64,
+    /// The receiver's chunks of its old version (send only what changed).
+    known: Option<Arc<std::collections::HashSet<Hash16>>>,
+}
+
+/// A block ready for the wire: (tag, payload, hash of the original, original length).
+type Block = (u8, Bytes, [u8; 32], u64);
+
+async fn send_file(
+    conn: &quinn::Connection,
+    f: SendFile,
     progress: &AtomicU64,
     gate: &Gate,
     limits: &Limits,
+    stats: &WireStats,
 ) -> Result<()> {
+    let (size, start) = (f.size, f.start);
     let mut stream = conn.open_uni().await?;
     let mut header = [0u8; 12];
-    header[..4].copy_from_slice(&index.to_le_bytes());
+    header[..4].copy_from_slice(&f.index.to_le_bytes());
     header[4..].copy_from_slice(&start.to_le_bytes());
     stream.write_all(&header).await?;
 
-    // Reader thread: reads and hashes blocks a few ahead of the network.
-    let (tx, mut rx) = mpsc::channel::<Result<(Bytes, [u8; 32])>>(PIPELINE_BLOCKS);
-    let path_owned = path.to_path_buf();
-    let reader = tokio::task::spawn_blocking(move || {
-        let run = || -> Result<()> {
-            let mut file = std::fs::File::open(&path_owned).map_err(|e| fatal(format!("Can't open {}: {e}", path_owned.display())))?;
-            file.seek(SeekFrom::Start(start))?;
-            let mut pos = start;
-            while pos < size {
-                let n = (size - pos).min(BLOCK) as usize;
-                let mut buf = vec![0u8; n];
-                file.read_exact(&mut buf).map_err(|_| fatal(format!("{} changed while sending", path_owned.display())))?;
-                let hash = *blake3::hash(&buf).as_bytes();
-                if tx.blocking_send(Ok((Bytes::from(buf), hash))).is_err() {
-                    return Ok(()); // network side gave up
+    // Reader thread: reads, hashes and compresses (or splits against the
+    // receiver's old version) a few blocks ahead of the network.
+    let (tx, mut rx) = mpsc::channel::<Result<Block>>(PIPELINE_BLOCKS);
+    let reader = {
+        tokio::task::spawn_blocking(move || {
+            let path = f.path;
+            let changed = || fatal(format!("{} changed while sending", path.display()));
+            let mut enc = Encoder::new(&f.name);
+            // Hands a block to the network, telling the encoder how long that waited.
+            let hand = |enc: &mut Encoder, block: Block| -> bool {
+                let n = block.3;
+                let t = std::time::Instant::now();
+                let ok = tx.blocking_send(Ok(block)).is_ok();
+                enc.sent(n, t.elapsed().as_secs_f64());
+                ok
+            };
+            let run = || -> Result<()> {
+                let mut file = std::fs::File::open(&path).map_err(|e| fatal(format!("Can't open {}: {e}", path.display())))?;
+                if let Some(known) = f.known.filter(|_| start == 0) {
+                    let mut sent = 0u64;
+                    delta::split((&mut file).take(size), &known, |block, segs| {
+                        let hash = *blake3::hash(block).as_bytes();
+                        let (tag, body) = if segs.iter().any(|s| matches!(s, Seg::Ref { .. })) {
+                            enc.pieces(block, segs)
+                        } else {
+                            enc.block(Bytes::copy_from_slice(block))
+                        };
+                        sent += block.len() as u64;
+                        Ok(hand(&mut enc, (tag, body, hash, block.len() as u64)))
+                    })?;
+                    if sent != size {
+                        return Err(changed());
+                    }
+                    return Ok(());
                 }
-                pos += n as u64;
+                file.seek(SeekFrom::Start(start))?;
+                let mut pos = start;
+                while pos < size {
+                    let n = (size - pos).min(BLOCK) as usize;
+                    let mut buf = vec![0u8; n];
+                    file.read_exact(&mut buf).map_err(|_| changed())?;
+                    let hash = *blake3::hash(&buf).as_bytes();
+                    let (tag, body) = enc.block(Bytes::from(buf));
+                    if !hand(&mut enc, (tag, body, hash, n as u64)) {
+                        return Ok(()); // network side gave up
+                    }
+                    pos += n as u64;
+                }
+                Ok(())
+            };
+            if let Err(e) = run() {
+                let _ = tx.blocking_send(Err(e));
             }
-            Ok(())
-        };
-        if let Err(e) = run() {
-            let _ = tx.blocking_send(Err(e));
-        }
-    });
+        })
+    };
 
     while let Some(item) = rx.recv().await {
-        let (data, hash) = item?;
-        let n = data.len() as u64;
+        let (tag, body, hash, n) = item?;
         gate.wait_conn(conn).await?;
-        limit::write(&mut stream, data, &[&limits.bench, &limits.up], Some((gate, conn))).await?;
+        let mut head = [tag, 0, 0, 0, 0];
+        let head = if tag == RAW {
+            &head[..1]
+        } else {
+            head[1..].copy_from_slice(&(body.len() as u32).to_le_bytes());
+            &head[..]
+        };
+        stream.write_all(head).await?;
+        let on_wire = (head.len() + body.len() + 32) as u64;
+        limit::write(&mut stream, body, &[&limits.bench, &limits.up], Some((gate, conn))).await?;
         stream.write_all(&hash).await?;
         progress.fetch_add(n, Ordering::Relaxed);
+        stats.add(n, on_wire);
+        if tag == PIECES {
+            stats.delta.store(true, Ordering::Relaxed);
+        }
     }
     let _ = reader.await;
     stream.finish()?;
@@ -571,6 +651,9 @@ async fn receive_batch(
     if let Err(e) = &result {
         match classify(e) {
             Outcome::Retry(_) if accepted && !shared.is_gone(id) => {
+                if e.chain().any(|c| c.is::<BaseChanged>()) {
+                    conn.close(RETRY, b"old copy changed");
+                }
                 // Keep the card; the sender will reconnect and we continue.
                 shared.interrupted.lock().unwrap().insert(fp, Interrupted { id });
                 shared.set_remote_pause(id, false);
@@ -625,7 +708,7 @@ async fn receive_files(
         }
     };
     if !accept {
-        write_frame(&mut ctl_tx, &Msg::Decision { accept: false, offsets: vec![], have: vec![], paused: false }).await?;
+        write_frame(&mut ctl_tx, &Msg::Decision { accept: false, offsets: vec![], have: vec![], paused: false, bases: vec![] }).await?;
         let _ = ctl_tx.finish();
         let _ = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await;
         return Ok(TransferState::Declined);
@@ -648,15 +731,24 @@ async fn receive_files(
             already += offsets[i];
         }
     }
+    // Old versions of the files we'll get from the start: their chunks let the
+    // sender skip what we already have (direct sends only; see `delta`).
+    let root = cfg.downloads.clone();
+    let cache_dir = cfg.data_dir.join("chunks");
+    let (bases, base_files) = if swarm || !delta_enabled() {
+        (Vec::new(), Arc::new(vec![None; files.len()]))
+    } else {
+        let (files, offsets, have, root, cache_dir) = (files.clone(), offsets.clone(), have.clone(), root.clone(), cache_dir.clone());
+        tokio::task::spawn_blocking(move || find_bases(&files, &offsets, &have, &root, &cache_dir)).await?
+    };
     let gate = shared.gate(id);
-    let decision = Msg::Decision { accept: true, offsets: offsets.clone(), have: have.clone(), paused: gate.local() };
+    let decision = Msg::Decision { accept: true, offsets: offsets.clone(), have: have.clone(), paused: gate.local(), bases };
     write_frame(&mut ctl_tx, &decision).await?;
     let told = matches!(decision, Msg::Decision { paused: true, .. });
     *accepted = true;
     progress.store(already, Ordering::Relaxed);
     shared.set_state(id, TransferState::Active);
 
-    let root = cfg.downloads.clone();
     tokio::fs::create_dir_all(&root).await.map_err(|e| fatal(format!("Can't create {}: {e}", root.display())))?;
 
     let state = Arc::new(BatchState { batch: std::sync::Mutex::new(batch), dirty: true.into(), pdir: pdir.clone(), fp });
@@ -683,6 +775,7 @@ async fn receive_files(
             )
             .await;
         }
+        let stats = shared.stats(id);
         let files_done = async {
             while finished < expected {
                 tokio::select! {
@@ -697,6 +790,9 @@ async fn receive_files(
                             conn: conn.clone(),
                             gate: gate.clone(),
                             limits: shared.limits.clone(),
+                            stats: stats.clone(),
+                            bases: base_files.clone(),
+                            cache_dir: cache_dir.clone(),
                         };
                         set.spawn(async move { receive_file(stream, ctx).await });
                     }
@@ -742,6 +838,51 @@ struct FileCtx {
     conn: quinn::Connection,
     gate: Arc<Gate>,
     limits: Arc<Limits>,
+    stats: Arc<WireStats>,
+    /// Old versions to build from, per file.
+    bases: Arc<Vec<Option<Arc<BaseFile>>>>,
+    cache_dir: PathBuf,
+}
+
+/// Delta is on unless `NEO_DELTA=0` (benchmarks).
+fn delta_enabled() -> bool {
+    std::env::var("NEO_DELTA").map(|v| v != "0").unwrap_or(true)
+}
+
+/// For each file we'll receive from its start: if the downloads folder already
+/// has a big enough file at the same path, chunk it (cached) and keep it open.
+fn find_bases(
+    files: &[FileMeta],
+    offsets: &[u64],
+    have: &[u32],
+    root: &Path,
+    cache_dir: &Path,
+) -> (Vec<String>, Arc<Vec<Option<Arc<BaseFile>>>>) {
+    let mut wire = vec![String::new(); files.len()];
+    let mut open = vec![None; files.len()];
+    let mut chunks = 0usize;
+    for (i, meta) in files.iter().enumerate() {
+        if have.contains(&(i as u32)) || offsets.get(i).copied().unwrap_or(0) != 0 || meta.size < delta::MIN_FILE {
+            continue;
+        }
+        let path = root.join(sanitize_rel_path(&meta.name));
+        if !std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() >= delta::MIN_FILE) {
+            continue;
+        }
+        let Ok(idx) = delta::index(cache_dir, &path) else { continue };
+        if chunks + idx.chunks.len() > delta::MAX_CHUNKS {
+            continue;
+        }
+        if let Ok(base) = BaseFile::open(&path, &idx) {
+            chunks += idx.chunks.len();
+            wire[i] = delta::to_wire(&idx);
+            open[i] = Some(Arc::new(base));
+        }
+    }
+    if open.iter().all(Option::is_none) {
+        wire.clear();
+    }
+    (wire, Arc::new(open))
 }
 
 async fn receive_file(mut stream: quinn::RecvStream, ctx: FileCtx) -> Result<usize> {
@@ -773,13 +914,17 @@ async fn receive_file(mut stream: quinn::RecvStream, ctx: FileCtx) -> Result<usi
         tokio::task::spawn_blocking(move || state.flush()).await?;
     }
 
-    // Writer thread: verifies each block's hash and writes it.
-    let (tx, mut rx) = mpsc::channel::<(Vec<u8>, [u8; 32])>(PIPELINE_BLOCKS);
+    // Writer thread: rebuilds each block (decompress, fill in chunks from the
+    // old version), verifies its hash and writes it.
+    let (tx, mut rx) = mpsc::channel::<(u8, Vec<u8>, usize, [u8; 32])>(PIPELINE_BLOCKS);
     let progress = ctx.progress.clone();
     let state = ctx.state.clone();
     let part = fs.part.clone();
     let size = meta.size;
+    let base = ctx.bases.get(index).cloned().flatten();
+    let cache_dir = ctx.cache_dir.clone();
     let writer = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut dec = Decoder::new()?;
         let mut file = match file {
             Some(f) => f,
             None => std::fs::OpenOptions::new()
@@ -793,10 +938,20 @@ async fn receive_file(mut stream: quinn::RecvStream, ctx: FileCtx) -> Result<usi
             file.seek(SeekFrom::Start(start)).map_err(disk)?;
         }
         let mut verified = start;
-        while let Some((block, hash)) = rx.blocking_recv() {
-            if blake3::hash(&block).as_bytes() != &hash {
+        while let Some((tag, body, len, hash)) = rx.blocking_recv() {
+            let base_ref = base.as_deref().map(|b| b as &dyn wire::Base);
+            let decoded = dec.decode(tag, body, len, base_ref);
+            let ok = matches!(&decoded, Ok((b, _)) if b.len() == len && blake3::hash(b).as_bytes() == &hash);
+            if !ok {
+                if tag == PIECES {
+                    if let Some(b) = &base {
+                        delta::forget(&cache_dir, &b.path);
+                    }
+                    return Err(BaseChanged.into());
+                }
                 return Err(fatal("A block failed its integrity check"));
             }
+            let (block, _) = decoded?;
             file.write_all(&block).map_err(disk)?;
             verified += block.len() as u64;
             progress.fetch_add(block.len() as u64, Ordering::Relaxed);
@@ -817,11 +972,28 @@ async fn receive_file(mut stream: quinn::RecvStream, ctx: FileCtx) -> Result<usi
             let n = (meta.size - pos).min(BLOCK) as usize;
             // One contiguous block: lets BLAKE3 use SIMD and the writer do one write.
             ctx.gate.wait_conn(&ctx.conn).await?;
-            let mut block = vec![0u8; n];
-            limit::read(&mut stream, &mut block, &ctx.limits.down, Some((&ctx.gate, &ctx.conn))).await?;
+            let mut tag = [0u8; 1];
+            stream.read_exact(&mut tag).await?;
+            let (body_len, head) = if tag[0] == RAW {
+                (n, 1)
+            } else {
+                let mut l = [0u8; 4];
+                stream.read_exact(&mut l).await?;
+                let l = u32::from_le_bytes(l) as usize;
+                if l > wire::MAX_BODY {
+                    bail!("oversized block");
+                }
+                (l, 5)
+            };
+            let mut body = vec![0u8; body_len];
+            limit::read(&mut stream, &mut body, &ctx.limits.down, Some((&ctx.gate, &ctx.conn))).await?;
             let mut hash = [0u8; 32];
             stream.read_exact(&mut hash).await?;
-            if tx.send((block, hash)).await.is_err() {
+            ctx.stats.add(n as u64, (head + body_len + 32) as u64);
+            if tag[0] == PIECES {
+                ctx.stats.delta.store(true, Ordering::Relaxed);
+            }
+            if tx.send((tag[0], body, n, hash)).await.is_err() {
                 break; // writer failed; its error is reported below
             }
             pos += n as u64;

@@ -1,5 +1,6 @@
-//! The left panel: your other devices, your contacts (online or not) and
-//! everyone else nearby, plus "Add by code".
+//! The left panel: your other devices and your contacts (online or not),
+//! plus "Add by code". Neo doesn't list strangers: people are added by code
+//! or QR code only.
 
 use gpui::Focusable;
 
@@ -8,17 +9,16 @@ use super::*;
 impl NeoView {
     pub(super) fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mine: Vec<&Peer> = self.peers.iter().filter(|p| p.account == Some(self.account)).collect();
-        let contact_of = |p: &Peer| p.account.and_then(|a| self.contacts.iter().find(|c| c.account == a));
-        let strangers: Vec<&Peer> =
-            self.peers.iter().filter(|p| p.account != Some(self.account) && contact_of(p).is_none()).collect();
-        let all_selected = !self.peers.is_empty() && self.peers.iter().all(|p| self.selected.contains(&p.id));
+        let known = |p: &&Peer| p.account.is_some_and(|a| a == self.account || self.contacts.iter().any(|c| c.account == a));
+        let visible: Vec<&Peer> = self.peers.iter().filter(known).collect();
+        let all_selected = !visible.is_empty() && visible.iter().all(|p| self.selected.contains(&p.id));
 
         let mut list = div().flex().flex_col().gap(px(2.)).pb(px(12.));
         if !mine.is_empty() {
             list = list.child(group_label("Your devices"));
             for p in &mine {
                 let sub = if p.remote { "Linked to you · over the internet" } else { "Linked to you" };
-                list = list.child(self.device_row(p, p.name.clone(), sub.into(), false, cx));
+                list = list.child(self.device_row(p, p.name.clone(), sub.into(), cx));
             }
         }
         if !self.contacts.is_empty() {
@@ -30,24 +30,12 @@ impl NeoView {
                 }
                 for p in online {
                     let sub = if p.remote { format!("{} · over the internet", p.name) } else { p.name.clone() };
-                    list = list.child(self.device_row(p, c.name.clone(), sub, false, cx));
+                    list = list.child(self.device_row(p, c.name.clone(), sub, cx));
                 }
             }
         }
-        if !strangers.is_empty() {
-            list = list.child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .pr(px(10.))
-                    .child(group_label("Nearby"))
-                    .child(div().pt(px(10.)).text_size(px(11.)).text_color(rgb(FAINT)).child("+ adds a contact")),
-            );
-            for p in &strangers {
-                list = list.child(self.device_row(p, p.name.clone(), p.account.map(|a| a.code()).unwrap_or(p.id.code()), true, cx));
-            }
-        }
-        let empty = self.peers.is_empty() && self.contacts.is_empty();
+        let empty = mine.is_empty() && self.contacts.is_empty();
+        let visible_ids: Vec<DeviceId> = visible.iter().map(|p| p.id).collect();
 
         div()
             .flex()
@@ -70,13 +58,13 @@ impl NeoView {
                         div()
                             .flex()
                             .gap(px(12.))
-                            .when(!self.peers.is_empty(), |d| {
+                            .when(!visible_ids.is_empty(), |d| {
                                 d.child(text_button("select-all", if all_selected { "Clear" } else { "Select all" }).on_click(
                                     cx.listener(move |this, _: &ClickEvent, _, cx| {
                                         if all_selected {
                                             this.selected.clear();
                                         } else {
-                                            this.selected = this.peers.iter().map(|p| p.id).collect();
+                                            this.selected = visible_ids.iter().copied().collect();
                                         }
                                         cx.notify();
                                     }),
@@ -127,12 +115,12 @@ impl NeoView {
                                 .flex()
                                 .flex_col()
                                 .gap(px(6.))
-                                .child(div().text_sm().text_color(rgb(MUTED)).child("Looking for devices…"))
+                                .child(div().text_sm().text_color(rgb(MUTED)).child("No contacts yet"))
                                 .child(
                                     div()
                                         .text_xs()
                                         .text_color(rgb(FAINT))
-                                        .child("Open Neo on another computer on this network and it will show up here."),
+                                        .child("Use Add by code with someone's code, or let them scan your QR code in Settings. Link your other computers in Settings too."),
                                 ),
                         )
                     })
@@ -140,7 +128,7 @@ impl NeoView {
             )
     }
 
-    fn device_row(&self, peer: &Peer, title: String, subtitle: String, addable: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn device_row(&self, peer: &Peer, title: String, subtitle: String, cx: &mut Context<Self>) -> impl IntoElement {
         let id = peer.id;
         let on = self.selected.contains(&id);
         let seed = peer.account.map(|a| a.0[0]).unwrap_or(id.0[0]);
@@ -165,14 +153,6 @@ impl NeoView {
                     .child(div().text_sm().truncate().child(SharedString::from(title)))
                     .child(div().text_xs().text_color(rgb(FAINT)).truncate().child(SharedString::from(subtitle))),
             )
-            .when(addable, |d| {
-                d.child(icon_button(SharedString::from(format!("add-{}", id.to_hex())), "+").text_size(px(16.)).on_click(cx.listener(
-                    move |this, _: &ClickEvent, _, cx| {
-                        cx.stop_propagation();
-                        this.node.command(Command::AddContact { device: id });
-                    },
-                )))
-            })
             .child(checkbox(on))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 if !this.selected.remove(&id) {
@@ -203,6 +183,6 @@ fn offline_row(c: &Contact) -> impl IntoElement {
                 .flex_1()
                 .overflow_hidden()
                 .child(div().text_sm().truncate().child(SharedString::from(c.name.clone())))
-                .child(div().text_xs().text_color(rgb(FAINT)).child("Not nearby")),
+                .child(div().text_xs().text_color(rgb(FAINT)).child("Offline")),
         )
 }

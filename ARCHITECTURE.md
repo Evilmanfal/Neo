@@ -32,11 +32,11 @@ There is no sign-up and no personal data. Identity has two layers:
 
 ### Contacts (pairing)
 
-- Click **+** next to someone nearby, or type their code under
-  **Add by code**. They see "X wants to add you as a contact" and accept or
-  decline. On acceptance both sides store each other under the names they
-  chose (`contacts.json`).
-- Contacts appear by name, even when they aren't nearby (greyed). For each
+- Type their code under **Add by code** (or scan the QR code in their
+  Settings). Neo never lists strangers, even on the same network. They see
+  "X wants to add you as a contact" and accept or decline. On acceptance both
+  sides store each other under the names they chose (`contacts.json`).
+- Contacts appear by name, even when they're offline (greyed). For each
   contact you can turn on **Accept files automatically**; nobody else's files
   skip the prompt.
 
@@ -74,8 +74,16 @@ There is no sign-up and no personal data. Identity has two layers:
 - **One UDP socket** (`net/socket.rs`), dual-stack IPv6 + IPv4, on a port
   that stays the same across restarts. QUIC, STUN and NAT keepalive "pokes"
   all share it; STUN replies and pokes are filtered out before QUIC sees them.
-- **LAN:** devices announce themselves over UDP multicast
-  (`239.255.77.7:47321`) every 2 s, then connect directly.
+- **LAN, contacts only** (`discovery.rs`): devices multicast an
+  announcement (`239.255.77.7:47321`) every 2 s, encrypted
+  (XChaCha20-Poly1305, random nonce) with a key derived from the account
+  code. Only people who know the code can read it: contacts, your linked
+  devices, and someone typing your code right now (so adding works on a LAN
+  with the internet down). Strangers see unlinkable blobs and Neo lists no
+  one else. Contacts on the same network then connect directly. Chosen over
+  relying on the DHT's private addresses because it keeps working offline.
+  Tests and `neo-cli --discover-all` also send the old readable
+  announcement; the app never does.
 - Connecting tries every known address of a device at once (LAN, router
   mapping, IPv6, public) and keeps the first that answers.
 
@@ -105,18 +113,41 @@ All of this runs automatically. Users never set anything up.
   - Contacts' records are read every 90 s. Devices updated in the last
     12 minutes show as reachable "over the internet".
 - **Codes over the internet:** a second record maps your code to your full
-  key. "Add by code" and "Link" fall back to it when the code isn't on the
-  LAN. Anyone with the code could overwrite it, but not forge it, because the
-  answer must hash to the code.
+  key and, since 0.2, also carries your devices' sealed addresses, so one
+  lookup finds both who and where (old 32-byte records still resolve, via a
+  second lookup). "Add by code" and "Link" look on the LAN and over the
+  internet at once and take whichever answers first. Anyone with the code
+  could overwrite the record, but not forge it, because the answer must hash
+  to the code. It's republished with every presence update, starting as soon
+  as the DHT is bootstrapped (checked every 3 s); good DHT nodes are saved in
+  `dht_nodes.json` to bootstrap faster next time.
+- **Fast reads:** DHT reads stream and take the first valid signed answer,
+  waiting at most 0.5 s more for a newer one, instead of the whole traversal.
+- **Measured** on the public DHT, two fresh profiles on one PC
+  (`--no-lan --no-private`; the final connect can't succeed here because the
+  router has no hairpin NAT, so "B is knocked" is when the person being
+  added learns about it and pokes back):
+
+  | Step (from A typing the code) | 0.1 | 0.2 |
+  |---|---|---|
+  | Code resolved | 6.4 s (lookup 2.8 s) | 4.0 s (lookup 0.85 s; most of the rest is A's own DHT bootstrap) |
+  | Devices' addresses known | 9.2 s (second lookup) | 4.0 s (in the code record) |
+  | Knock sent | 18.4 s (after a 6 s failed direct try) | 8.0 s (in parallel) |
+  | B is knocked | 29.0 s (15 s polling) | 10.6 s (2 s polling) |
+
+  Time from B starting until its code was findable: 7.1 s vs 7.8 s (DHT
+  bootstrap ~3 s plus a 3–5 s write; not faster on a fresh profile, since
+  saved nodes only help from the second start).
 - **Hole punching:**
   - Contacts send each other an 8-byte "poke" every 15 s, which keeps a path
     open through both routers.
   - For a first contact the other router drops packets from strangers. So the
     caller publishes a "knock" (its addresses, under a key derived from the
-    callee's key). The callee checks for knocks every 30 s and pokes back for
-    90 s, while the caller keeps retrying for up to 75 s.
-  - So adding someone over the internet can take up to about a minute; later
-    transfers connect right away.
+    callee's key). The caller knocks at the same time as its first direct
+    attempt (for a device it hasn't reached in 10 minutes), not after it
+    fails. The callee checks for knocks every 2 s for the first 3 minutes
+    after start, then every 5 s, and pokes back for 90 s, while the caller
+    keeps retrying for up to 75 s. Later transfers connect right away.
 - **Strict routers** (`net/punch.rs`), only when the plain attempt fails.
   The knock carries the caller's NAT type and a random 8-byte session token;
   both sides then run the same planned punch session and probe with
@@ -164,7 +195,16 @@ All of this runs automatically. Users never set anything up.
 Settings shows a one-line connection status (green when contacts can reach
 you). `NEO_DEBUG=1` prints diagnostics to stderr.
 
-## Protocol (`neo/4`)
+## Protocol (`neo/6`)
+
+`neo/5` (Neo 0.1) added pausing; `neo/6` adds compressed and delta blocks.
+Both sides still offer `neo/5` in the TLS handshake only so a mismatch can be
+explained: a new device closes a `neo/5` connection with code `2` and the
+reason "The other device has a newer version of Neo. Update Neo on this
+computer to reach it." (Neo 0.1 shows that reason as the failure), and tells
+its own user that device needs to update. A new device that reaches an old
+one fails the send with "<name> has an older version of Neo. Ask them to
+update Neo, then try again." No retries either way.
 
 There is one connection per (sender, recipient). The first control frame says what
 the connection is for: `Offer` (files), `Pair` (become contacts) or
@@ -173,14 +213,83 @@ the connection is for: `Offer` (files), `Pair` (become contacts) or
 1. A control stream carries length-prefixed JSON. The sender sends `Offer`
    (each file's name, size and a fingerprint of its path, size and mtime, plus
    the sender's account attestation).
-   The recipient replies `Decision`, saying where each file should start and
-   which files it already has, and later sends `Complete`.
+   The recipient replies `Decision`, saying where each file should start,
+   which files it already has, and the chunk hashes of old versions it holds
+   (see below), and later sends `Complete`.
 2. There is one stream per file still needed: a `u32` index, a `u64` start
-   offset, then the file in 1 MiB blocks, each followed by its BLAKE3 hash.
-   The receiver checks every block before counting it and writes into
-   `name.neopart`, then renames the file. Peer-supplied paths are sanitized.
+   offset, then the file in 1 MiB blocks. Each block is a tag (raw, zstd, or
+   pieces), its payload, and the BLAKE3 hash of its original bytes
+   (`wire.rs`). The receiver rebuilds and checks every block before counting
+   it and writes into `name.neopart`, then renames the file. Peer-supplied
+   paths are sanitized.
 3. Error codes on close: `1` cancelled, `2` failed (with a reason, no retry),
-   `3` superseded by a reconnect.
+   `3` superseded by a reconnect, `6` reconnect now (an old copy used for
+   delta turned out to differ from its index).
+
+## Compression, delta and congestion control
+
+All automatic; the received file is always byte-identical to the original,
+because every block's BLAKE3 hash is over the original bytes and is checked
+after decompressing and rebuilding.
+
+- **Compression** (`wire.rs`): each 1 MiB block is compressed with zstd
+  level 1 on the sender's reader thread (one context per stream) and
+  decompressed on the receiver's writer thread. A block that doesn't shrink
+  by 8% goes raw; after two misses a file goes raw and re-tries one block in
+  64. Names like `.zip`/`.mp4`/`.jpg` start raw but are still sampled. The
+  reader measures itself every 16 blocks: if the network never held it back
+  (CPU-bound, as on a fast LAN), it tries 16 blocks raw and keeps whichever
+  way moved more bytes per second, checking again later. Speed limits count
+  bytes on the wire; progress and speed shown are in original bytes, plus a
+  subtle "saved X%". In a swarm the sender compresses once and recipients
+  forward blocks still compressed. `NEO_COMPRESS=0` turns it off
+  (benchmarks).
+- **Send only what changed** (`delta.rs`), direct sends only: if the receiver
+  already has a file at the same path in its downloads folder (usually the
+  previous version), it cuts that file into FastCDC chunks (~64 KiB average,
+  BLAKE3, cached by path, size and mtime) and puts the 16-byte hashes in its
+  `Decision`. The sender chunks the new file the same way while streaming;
+  known chunks travel as ~24-byte references, the rest as (compressed) data.
+  Blocks stay 1 MiB, so resume is unchanged (a resumed file continues
+  without delta). The old file is opened read-only and locked against writes
+  while in use, is never modified, and the new version is saved next to it
+  ("name (1)") like any re-send. Skipped below 4 MiB, without a base, in
+  swarms (each recipient may hold a different old version) and above
+  250,000 chunks (~16 GB) per batch. If an old copy changed while keeping
+  its timestamp, a block fails its check, the cache entry is dropped and
+  the transfer reconnects and finishes without it. The row then reads
+  "Updated: sent only X of Y". `NEO_DELTA=0` turns it off.
+- **Congestion control:** BBR for every connection (`tls::transport`);
+  `NEO_CC=cubic` switches back. Measured through a simulated 50 Mbit/s
+  bottleneck (1 BDP drop-tail buffer, `tests/cc.rs`), in Mbit/s:
+
+  | Link | BBR | Cubic |
+  |---|---|---|
+  | RTT 100 ms, no loss | 48.8 | 48.9 |
+  | RTT 100 ms, 1% loss | 48.3 | 1.2 |
+  | RTT 100 ms, 3% loss | 48.7 | 0.8 |
+  | RTT 200 ms, 1% loss | 47.5 | 0.6 |
+
+  Cubic's 1.2 Mbit/s at 1% loss matches the textbook TCP estimate
+  (MSS/RTT · 1.22/√p), so the simulation is sane. Two flows sharing the
+  link: BBR+BBR split 33/19 (Jain fairness 0.93; 0.98 at 1% loss),
+  Cubic+Cubic 40/9 (0.70). **BBR is not fair to Cubic:** a BBR flow next to a
+  Cubic one took 53 vs 0.1. So on a shared home uplink, a big Neo send can
+  crowd out other TCP traffic; the upload limit in Settings is the remedy
+  (and `NEO_CC=cubic`). quinn's BBR is marked experimental; it carried a
+  3 MB transfer byte-perfect through 3% loss and 100 ms RTT in the test.
+
+Measured on this PC (loopback; `tests/wire_delta.rs`, ignored benchmarks):
+
+- 28 MB of Rust source over a 3.5 MB/s upload: 8.0 s raw, 1.3 s compressed
+  (16% of the bytes, 21 MB/s effective).
+- 200 MB of text with no cap: 0.67 s raw, 0.59 s with adaptive compression,
+  so compression doesn't slow a fast link down.
+- A 300 MB file edited (20 KB inserted, 300 KB deleted, 100 KB appended) and
+  sent again: 0.6 MB on the wire. From Send to done: 1.14 s for the first
+  full send, 0.72 s for the re-send including the receiver chunking its old
+  copy, 0.46 s once cached, and 0.70 s at a 3.5 MB/s upload (a full send
+  would take ~86 s).
 
 ## Swarm fan-out (several recipients)
 
@@ -402,6 +511,39 @@ Gofile account, so anyone can download from Gofile's normal web page
   half-sent file, so if its server drops a long-stalled connection, that one
   file starts over (into the same folder, with the same link). Finished files
   are never sent again. The row says so while paused.
+
+## Updates
+
+- **Check** (`update.rs`): one HTTPS request to GitHub's latest-release API
+  3 s after start and every 12 hours; nothing else. Failures (offline,
+  rate-limited) are silent. `NEO_UPDATE_URL` points it at a mock for tests.
+- **Prompt:** "Neo vX.Y.Z is available" with the first line of the release
+  notes, **Update now** and **Later**. Later hides it until the next start
+  (a newer version brings it back) and leaves an **Update to vX** pill in the
+  header. With transfers running, Update now offers to wait for them
+  ("Update when they finish"); interrupted transfers resume anyway.
+- **Trust:** each release ships `neo.exe.sig`, an Ed25519 signature over
+  `"neo-release-v1" || BLAKE3(neo.exe)`. The public key is built in
+  (`update::RELEASE_KEY`); the private key lives only on the developer's PC
+  (`%APPDATA%\Neo-release\release.key`, never in the repo). A download that
+  doesn't verify is deleted, never run. So a hijacked GitHub account or a bad
+  download can't push malware.
+- **Install:** download to `neo.update.part` next to the exe, verify, rename
+  `neo.exe` to `neo.old.exe` (Windows allows renaming a running exe), move the
+  new file in, start it with `--updated` and quit. The new copy waits for the
+  old one to exit and deletes `neo.old.exe`.
+
+### Releasing a version
+
+1. Bump `version` in the workspace `Cargo.toml` (e.g. `0.2.0`).
+2. `./build.ps1 build -Release` (or `cargo build --release`).
+3. `target/release/neo-cli.exe sign-release target/release/neo.exe` writes
+   `neo.exe.sig`. The first run creates the key; it prints the public key,
+   which must equal `update::RELEASE_KEY` (and warns if not). Back the key up
+   somewhere safe: losing it means users must download the next version by
+   hand; leaking it means someone could sign builds.
+4. `gh release create v0.2.0 target/release/neo.exe target/release/neo.exe.sig --notes-file NOTES.md`
+   The first line of the notes shows in the prompt.
 
 ## Offline recipients (decided)
 

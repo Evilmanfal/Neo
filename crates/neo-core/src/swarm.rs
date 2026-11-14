@@ -22,6 +22,10 @@
 //!   ask the sender for any block they still miss.
 //! - **Resume:** blocks may arrive out of order, but the resume record keeps
 //!   the contiguous verified prefix of each file, as in direct sends.
+//! - **Compression:** the sender compresses each block once (see `wire`);
+//!   recipients forward it still compressed and only decompress their own copy.
+//!   Delta ("send only what changed") is for direct sends only: a swarm's
+//!   recipients may each hold a different old version.
 //! - **Pause:** a paused recipient gets no new blocks from the sender (the
 //!   others take them), and pushes to it are dropped like pushes to a slow
 //!   peer, so nobody else waits. It asks for what it missed after resuming.
@@ -42,6 +46,7 @@ use crate::identity::{hex, unhex, DeviceId};
 use crate::proto::{read_frame, write_frame, FileMeta, Msg, BLOCK};
 use crate::transfer::{self, fatal, BatchState};
 use crate::limit::{self, Gate, Limits};
+use crate::wire::{self, Decoder, Encoder, RAW};
 use crate::{partial, Direction, Peer, Shared, TransferInfo, TransferState};
 
 const STREAM_DATA: u8 = 1;
@@ -115,7 +120,10 @@ struct Coordinator {
     /// Next block nobody has been given yet.
     cursor: Mutex<(usize, u64)>,
     recipients: Mutex<HashMap<DeviceId, Recipient>>,
-    cache: Mutex<VecDeque<((u32, u64), Bytes)>>,
+    /// Recently sent blocks as they went on the wire: (tag, payload, original length).
+    cache: Mutex<VecDeque<((u32, u64), (u8, Bytes, usize))>>,
+    /// One compressor per file (blocks of one file compress one at a time).
+    encoders: Mutex<HashMap<usize, Arc<Mutex<Encoder>>>>,
     handles: Mutex<HashMap<usize, Arc<std::fs::File>>>,
     batch: [u8; 16],
     secret: [u8; 32],
@@ -247,11 +255,12 @@ impl Coordinator {
 
     /// Reads a block (or takes it from the cache), hashing it the first time
     /// and announcing the hash to every recipient.
-    async fn block(&self, f: u32, b: u64) -> Result<(Bytes, [u8; 32])> {
-        if let Some((_, data)) = self.cache.lock().unwrap().iter().find(|(k, _)| *k == (f, b)) {
+    /// Returns (tag, payload, hash, original length), compressed when worthwhile.
+    async fn block(&self, f: u32, b: u64) -> Result<(u8, Bytes, [u8; 32], usize)> {
+        if let Some((_, (tag, data, n))) = self.cache.lock().unwrap().iter().find(|(k, _)| *k == (f, b)) {
             let h = self.hashes.lock().unwrap()[f as usize][b as usize];
             if let Some(h) = h {
-                return Ok((data.clone(), h));
+                return Ok((*tag, data.clone(), h, *n));
             }
         }
         let (path, meta) = self.files[f as usize].clone();
@@ -269,13 +278,21 @@ impl Coordinator {
             }
         };
         let len = block_len(meta.size, b);
-        let data = tokio::task::spawn_blocking(move || -> Result<Bytes> {
+        let enc = self
+            .encoders
+            .lock()
+            .unwrap()
+            .entry(f as usize)
+            .or_insert_with(|| Arc::new(Mutex::new(Encoder::new(&meta.name))))
+            .clone();
+        let (tag, data, hash) = tokio::task::spawn_blocking(move || -> Result<(u8, Bytes, [u8; 32])> {
             let mut buf = vec![0u8; len];
             read_at(&handle, &mut buf, b * BLOCK).map_err(|_| fatal(format!("{} changed while sending", path.display())))?;
-            Ok(Bytes::from(buf))
+            let hash = *blake3::hash(&buf).as_bytes();
+            let (tag, data) = enc.lock().unwrap().block(Bytes::from(buf));
+            Ok((tag, data, hash))
         })
         .await??;
-        let hash = *blake3::hash(&data).as_bytes();
         let fresh = {
             let mut hashes = self.hashes.lock().unwrap();
             let slot = &mut hashes[f as usize][b as usize];
@@ -299,8 +316,8 @@ impl Coordinator {
         if cache.len() >= CACHE_BLOCKS {
             cache.pop_front();
         }
-        cache.push_back(((f, b), data.clone()));
-        Ok((data, hash))
+        cache.push_back(((f, b), (tag, data.clone(), len)));
+        Ok((tag, data, hash, len))
     }
 }
 
@@ -358,6 +375,7 @@ pub(crate) async fn send_job(
         cursor: Mutex::new((0, 0)),
         recipients: Mutex::new(HashMap::new()),
         cache: Mutex::new(VecDeque::new()),
+        encoders: Mutex::new(HashMap::new()),
         handles: Mutex::new(HashMap::new()),
         batch: random(),
         secret: random(),
@@ -467,7 +485,7 @@ async fn send_attempt(
         shared.set_state(id, TransferState::Waiting);
     }
     let (offsets, have) = match read_frame::<Msg>(&mut ctl_rx).await? {
-        Msg::Decision { accept: true, offsets, have, paused } => {
+        Msg::Decision { accept: true, offsets, have, paused, .. } => {
             shared.set_remote_pause(id, paused);
             (offsets, have)
         }
@@ -521,6 +539,7 @@ async fn send_attempt(
         let mut data = conn.open_uni().await?;
         data.write_all(&[STREAM_DATA]).await?;
         let wake = coord.wake(peer.id);
+        let stats = shared.stats(id);
         let mut pause_rx = gate.subscribe();
         let mut told = offered_paused;
         let on_msg = |m: Msg| -> Result<Option<TransferState>> {
@@ -545,13 +564,15 @@ async fn send_attempt(
             // others carry on with them.
             let next = if gate.paused() { None } else { coord.assign(peer.id) };
             if let Some((f, b)) = next {
-                let (bytes, hash) = coord.block(f, b).await?;
-                let mut header = Vec::with_capacity(48);
+                let (tag, bytes, hash, n) = coord.block(f, b).await?;
+                let mut header = Vec::with_capacity(49);
                 header.extend_from_slice(&f.to_le_bytes());
                 header.extend_from_slice(&b.to_le_bytes());
                 header.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                 header.extend_from_slice(&hash);
+                header.push(tag);
                 data.write_all(&header).await?;
+                stats.add(n as u64, (header.len() + bytes.len()) as u64);
                 limit::write(&mut data, bytes, &[&shared.limits.bench, &shared.limits.up], Some((&*gate, &conn))).await?;
                 continue;
             }
@@ -627,8 +648,11 @@ pub(crate) struct SwarmRecv {
     sizes: Vec<u64>,
     state: Mutex<RecvState>,
     writer: mpsc::Sender<(u32, u64, Bytes)>,
+    /// Decompresses blocks (from the sender or peers) for our own copy.
+    dec: Mutex<Decoder>,
+    stats: Arc<crate::WireStats>,
     /// Push queues toward linked peers.
-    links: Mutex<HashMap<DeviceId, mpsc::Sender<(u32, u64, Bytes)>>>,
+    links: Mutex<HashMap<DeviceId, mpsc::Sender<(u32, u64, u8, Bytes)>>>,
     control: mpsc::UnboundedSender<Msg>,
     duplicate: AtomicU64,
     gate: Arc<Gate>,
@@ -648,22 +672,39 @@ impl SwarmRecv {
         st.pending.remove(&(f, b))
     }
 
-    /// A block arrived from the sender (with its hash) or from a peer.
-    async fn accept(self: &Arc<Self>, f: u32, b: u64, data: Bytes, inline: Option<[u8; 32]>) -> Result<()> {
+    /// A block arrived from the sender (with its hash) or from a peer, as it
+    /// travelled (`tag` + payload, see `wire`).
+    async fn accept(self: &Arc<Self>, f: u32, b: u64, tag: u8, payload: Bytes, inline: Option<[u8; 32]>) -> Result<()> {
         let from_sender = inline.is_some();
         let (fi, bi) = (f as usize, b as usize);
-        if fi >= self.sizes.len() || b >= nblocks(self.sizes[fi]) || data.len() != block_len(self.sizes[fi], b) {
+        let bad = |what: &str| -> Result<()> {
             if from_sender {
-                bail!("sender sent a block that doesn't fit");
+                bail!("sender sent {what}");
             }
-            return Ok(()); // a peer sent garbage: ignore it
+            Ok(()) // a peer sent garbage: ignore it
+        };
+        if fi >= self.sizes.len() || b >= nblocks(self.sizes[fi]) {
+            return bad("a block that doesn't fit");
         }
+        let want = block_len(self.sizes[fi], b);
         if from_sender {
-            // Pass it on to everyone linked with us. A full queue means that
-            // peer is slow: skip it (it'll ask the sender later) rather than wait.
+            // Pass it on, still compressed, to everyone linked with us. A full
+            // queue means that peer is slow: skip it (it'll ask the sender
+            // later) rather than wait.
             for tx in self.links.lock().unwrap().values() {
-                let _ = tx.try_send((f, b, data.clone()));
+                let _ = tx.try_send((f, b, tag, payload.clone()));
             }
+        }
+        let data = if tag == RAW {
+            payload
+        } else {
+            match self.dec.lock().unwrap().decode(tag, payload.to_vec(), want, None) {
+                Ok((d, _)) => Bytes::from(d),
+                Err(_) => return bad("a block that doesn't decode"),
+            }
+        };
+        if data.len() != want {
+            return bad("a block that doesn't fit");
         }
         let hash = {
             let mut st = self.state.lock().unwrap();
@@ -795,6 +836,8 @@ pub(crate) async fn receive(
             last_new: Instant::now(),
         }),
         writer: writer_tx,
+        dec: Mutex::new(Decoder::new()?),
+        stats: shared.stats(id),
         links: Mutex::new(HashMap::new()),
         control: control_tx,
         duplicate: AtomicU64::new(0),
@@ -886,18 +929,21 @@ pub(crate) async fn receive(
                             let r: Result<()> = async {
                                 loop {
                                     recv.gate.wait_conn(&conn).await?;
-                                    let mut h = [0u8; 48];
+                                    let mut h = [0u8; 49];
                                     s.read_exact(&mut h).await?;
                                     let f = u32::from_le_bytes(h[..4].try_into().unwrap());
                                     let b = u64::from_le_bytes(h[4..12].try_into().unwrap());
                                     let len = u32::from_le_bytes(h[12..16].try_into().unwrap()) as usize;
                                     let hash: [u8; 32] = h[16..48].try_into().unwrap();
-                                    if len as u64 > BLOCK {
+                                    let tag = h[48];
+                                    if len > wire::MAX_BODY {
                                         bail!("oversized block");
                                     }
                                     let mut data = vec![0u8; len];
                                     limit::read(&mut s, &mut data, &recv.limits.down, Some((&recv.gate, &conn))).await?;
-                                    recv.accept(f, b, Bytes::from(data), Some(hash)).await?;
+                                    let raw = (recv.sizes.get(f as usize).copied().unwrap_or(0)).saturating_sub(b * BLOCK).min(BLOCK);
+                                    recv.stats.add(raw, (len + 49) as u64);
+                                    recv.accept(f, b, tag, Bytes::from(data), Some(hash)).await?;
                                 }
                             }
                             .await;
@@ -914,7 +960,7 @@ pub(crate) async fn receive(
                                 let b = u64::from_le_bytes(h[4..12].try_into().unwrap());
                                 let hash: [u8; 32] = h[12..44].try_into().unwrap();
                                 if let Some(data) = recv.on_hash(f, b, hash) {
-                                    let _ = recv.accept(f, b, data, None).await;
+                                    let _ = recv.accept(f, b, RAW, data, None).await;
                                 }
                             }
                         });
@@ -1097,7 +1143,7 @@ pub(crate) async fn handle_hello(
 
 /// Pushes our sender-given blocks to `peer` and takes theirs.
 async fn run_link(recv: Arc<SwarmRecv>, conn: quinn::Connection, peer: DeviceId, _tx: quinn::SendStream, _rx: quinn::RecvStream) {
-    let (push_tx, mut push_rx) = mpsc::channel::<(u32, u64, Bytes)>(PUSH_QUEUE);
+    let (push_tx, mut push_rx) = mpsc::channel::<(u32, u64, u8, Bytes)>(PUSH_QUEUE);
     {
         let mut links = recv.links.lock().unwrap();
         if links.contains_key(&peer) {
@@ -1113,11 +1159,12 @@ async fn run_link(recv: Arc<SwarmRecv>, conn: quinn::Connection, peer: DeviceId,
             let mut s = conn.open_uni().await?;
             s.write_all(&[STREAM_PUSH]).await?;
             let limits = recv_out.limits.clone();
-            while let Some((f, b, data)) = push_rx.recv().await {
-                let mut h = Vec::with_capacity(16);
+            while let Some((f, b, tag, data)) = push_rx.recv().await {
+                let mut h = Vec::with_capacity(17);
                 h.extend_from_slice(&f.to_le_bytes());
                 h.extend_from_slice(&b.to_le_bytes());
                 h.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                h.push(tag);
                 s.write_all(&h).await?;
                 limit::write(&mut s, data, &[&limits.up], None).await?;
             }
@@ -1133,17 +1180,19 @@ async fn run_link(recv: Arc<SwarmRecv>, conn: quinn::Connection, peer: DeviceId,
         }
         loop {
             recv.gate.wait_conn(&conn).await?;
-            let mut h = [0u8; 16];
+            let mut h = [0u8; 17];
             s.read_exact(&mut h).await?;
             let f = u32::from_le_bytes(h[..4].try_into().unwrap());
             let b = u64::from_le_bytes(h[4..12].try_into().unwrap());
             let len = u32::from_le_bytes(h[12..16].try_into().unwrap()) as usize;
-            if len as u64 > BLOCK {
+            if len > wire::MAX_BODY {
                 bail!("oversized block");
             }
             let mut data = vec![0u8; len];
             limit::read(&mut s, &mut data, &recv.limits.down, Some((&recv.gate, &conn))).await?;
-            recv.accept(f, b, Bytes::from(data), None).await?;
+            let raw = (recv.sizes.get(f as usize).copied().unwrap_or(0)).saturating_sub(b * BLOCK).min(BLOCK);
+            recv.stats.add(raw, (len + 17) as u64);
+            recv.accept(f, b, h[16], Bytes::from(data), None).await?;
         }
     }
     .await;

@@ -1,3 +1,7 @@
 target/
 *.neopart
 /dist/
+
+# Release signing: the key never belongs in the repo
+*.key
+*.sig

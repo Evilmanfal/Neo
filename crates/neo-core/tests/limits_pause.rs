@@ -27,6 +27,8 @@ fn node(root: &Path, name: &str) -> NodeHandle {
         dht_bootstrap: None,
         publish_lan: true,
         nat_traversal: false,
+        check_updates: false,
+        discover_all: true,
     })
     .unwrap()
 }
@@ -92,8 +94,13 @@ async fn download_and_upload_limits_hold_the_total_rate() {
     let root = temp_dir("rates");
     let (a, b) = (node(&root, "a"), node(&root, "b"));
     let file = root.join("thirty.bin");
+    // A different file for each timed send: a second copy of the same name
+    // would go as a delta (only changes) and finish at once.
+    let (second, third) = (root.join("second.bin"), root.join("third.bin"));
     let data = noise(30 * MB, 5);
     std::fs::write(&file, &data).unwrap();
+    std::fs::write(&second, noise(30 * MB, 6)).unwrap();
+    std::fs::write(&third, noise(30 * MB, 7)).unwrap();
 
     // Download limit on the receiver: QUIC flow control slows the sender.
     let peer = see(&a, &b).await;
@@ -107,7 +114,7 @@ async fn download_and_upload_limits_hold_the_total_rate() {
     // Upload limit on the sender (and B unlimited again).
     b.command(Command::SetLimits { up: None, down: None });
     a.command(Command::SetLimits { up: Some(15.0), down: None });
-    let secs = timed_send(&a, &b, &peer, &file).await;
+    let secs = timed_send(&a, &b, &peer, &second).await;
     let rate = 30.0 / secs;
     eprintln!("upload limit 15 MB/s: measured {rate:.2} MB/s");
     assert!((13.5..=16.5).contains(&rate), "upload capped at 15 MB/s, measured {rate:.2} MB/s");
@@ -116,7 +123,7 @@ async fn download_and_upload_limits_hold_the_total_rate() {
     let saved = neo_core::Settings::load(&root.join("a/data"));
     assert_eq!(saved.upload_limit, Some(15.0));
     a.command(Command::SetLimits { up: Some(2.0), down: None });
-    a.command(Command::Send { paths: vec![file.clone()], peers: vec![peer] });
+    a.command(Command::Send { paths: vec![third.clone()], peers: vec![peer] });
     wait_for(&b, |e| matches!(e, Event::State { state: TransferState::Active, .. }).then_some(())).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let lifted = Instant::now();

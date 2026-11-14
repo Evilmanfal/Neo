@@ -1,4 +1,5 @@
-//! Wire protocol (ALPN `neo/5`; `neo/4` added swarm fan-out, see `swarm`;
+//! Wire protocol (ALPN `neo/6`; `neo/6` added compressed and delta blocks,
+//! see `wire` and `delta`; `neo/4` added swarm fan-out, see `swarm`;
 //! `neo/5` added pausing: `Pause` frames both ways on the control stream).
 //!
 //! One QUIC connection per (sender, recipient). On it:
@@ -61,6 +62,11 @@ pub enum Msg {
         /// The recipient has this transfer paused.
         #[serde(default)]
         paused: bool,
+        /// Per file: the chunk hashes of the recipient's old version (hex of
+        /// 16-byte BLAKE3 prefixes), so only changes need to travel. Empty =
+        /// no base (see `delta`).
+        #[serde(default)]
+        bases: Vec<String>,
     },
     /// Either side, any time after the Decision: paused or resumed here.
     Pause { paused: bool },

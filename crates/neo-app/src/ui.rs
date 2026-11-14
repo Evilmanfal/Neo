@@ -7,6 +7,7 @@ mod gofile;
 mod requests;
 mod settings;
 mod side;
+mod update;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -61,11 +62,36 @@ struct Transfer {
     moved: Instant,
     /// (paused by you, paused by them).
     paused: (bool, bool),
+    /// This session: original bytes moved, bytes that crossed the network for
+    /// them, and whether only changes were sent.
+    raw: u64,
+    wire: u64,
+    delta: bool,
 }
 
 impl Transfer {
     fn is_paused(&self) -> bool {
         !self.state.is_finished() && (self.paused.0 || self.paused.1)
+    }
+
+    /// Share of bytes compression and delta kept off the network, if it's
+    /// worth mentioning.
+    fn saved(&self) -> Option<u32> {
+        if self.raw < (256 << 10) || self.wire >= self.raw {
+            return None;
+        }
+        let pct = ((1.0 - self.wire as f64 / self.raw as f64) * 100.0).round() as u32;
+        (pct >= 5).then_some(pct)
+    }
+
+    /// " · saved 38%" / " · only changes, saved 97%" (empty if nothing to say).
+    fn saved_note(&self) -> String {
+        match (self.delta, self.saved()) {
+            (true, Some(p)) => format!(" · only changes, saved {p}%"),
+            (true, None) => " · only changes".into(),
+            (false, Some(p)) => format!(" · saved {p}%"),
+            (false, None) => String::new(),
+        }
     }
 }
 
@@ -155,6 +181,7 @@ pub struct NeoView {
     demo_gofile: Option<PathBuf>,
     demo_gofile_stage_only: bool,
     shared_links: Vec<SharedLink>,
+    up: update::UpdateState,
 }
 
 impl NeoView {
@@ -184,6 +211,7 @@ impl NeoView {
             while let Ok(ev) = events.recv().await {
                 let alive = this.update(cx, |this, cx| {
                     this.apply(ev, cx);
+                    this.update_if_idle(cx);
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -214,6 +242,7 @@ impl NeoView {
             demo_gofile: args.demo_gofile_upload.clone(),
             demo_gofile_stage_only: args.demo_gofile_stage_only,
             shared_links: Vec::new(),
+            up: Default::default(),
             code: node.account.code().into(),
             account: node.account,
             person_name: node.person_name.clone(),
@@ -288,6 +317,9 @@ impl NeoView {
                     sample: (Instant::now(), 0),
                     moved: Instant::now(),
                     paused: (false, false),
+                    raw: 0,
+                    wire: 0,
+                    delta: false,
                 };
                 self.transfers.insert(0, t);
                 self.reindex();
@@ -349,6 +381,11 @@ impl NeoView {
                     t.moved = Instant::now();
                 }
             }
+            Event::Wire { id, raw, wire, delta } => {
+                if let Some(t) = self.get(id) {
+                    (t.raw, t.wire, t.delta) = (raw, wire, delta);
+                }
+            }
             Event::PairRequest { id, name, account, device_name } => {
                 self.alert(&format!("{name} wants to add you as a contact"), "Open Neo to accept or decline.");
                 self.requests.push(Request::Pair { id, name, account, device_name });
@@ -362,6 +399,7 @@ impl NeoView {
             Event::RequestClosed { id } => self.requests.retain(|r| r.id() != id),
             Event::Info(text) => self.show_info(text, cx),
             Event::Gofile(e) => self.apply_gofile(e, cx),
+            Event::Update(e) => self.apply_update(e, cx),
             Event::LinkShared { from, title, url } => {
                 self.alert(&format!("{from} sent you a Gofile link"), &title);
                 if !self.shared_links.iter().any(|l| l.url == url) {
@@ -733,6 +771,7 @@ impl NeoView {
                     .flex()
                     .items_center()
                     .gap(px(8.))
+                    .children(self.update_pill(cx))
                     .child(self.tabs(cx))
                     .child(pill_button("settings", if self.settings_open { "Close settings" } else { "Settings" }, false).on_click(
                         cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -1040,13 +1079,22 @@ impl NeoView {
                 if !eta.is_empty() {
                     s.push_str(&format!(" · {eta}"));
                 }
+                s.push_str(&t.saved_note());
                 (s, MUTED)
             }
             TransferState::Interrupted if incoming => {
                 (format!("Interrupted at {} · resumes when {who} reconnects", format::bytes(t.done)), WARN)
             }
             TransferState::Interrupted => ("Connection lost · reconnecting…".into(), WARN),
-            TransferState::Done { .. } => (if incoming { "Saved".into() } else { "Delivered".into() }, OK),
+            TransferState::Done { .. } => {
+                let mut s = String::from(if incoming { "Saved" } else { "Delivered" });
+                if t.delta {
+                    s.push_str(&format!(" · updated: sent only {} of {}", format::bytes(t.wire), format::bytes(t.info.total)));
+                } else if let Some(p) = t.saved() {
+                    s.push_str(&format!(" · {p}% smaller on the way"));
+                }
+                (s, OK)
+            }
             TransferState::Declined => ("Declined".into(), MUTED),
             TransferState::Cancelled => ("Cancelled".into(), MUTED),
             TransferState::Failed(e) => (format!("Failed · {e}"), BAD),

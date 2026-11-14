@@ -4,15 +4,24 @@
 //!   neo-cli send    [--profile P] [--peers N] FILE_OR_FOLDER...
 //!   neo-cli pair    [--profile P] [--person NAME] CODE
 //!   neo-cli link    [--profile P] CODE
+//!   neo-cli sign-release [--key FILE] neo.exe
 //!
 //! `--no-lan` turns off LAN discovery and `--no-private` stops publishing
 //! LAN addresses, to exercise the internet path on one machine.
 //!
 //! `receive` auto-accepts every offer. `send` waits until N peers are visible
-//! on the LAN, then sends to all of them at once and exits when done.
+//! on the LAN, then sends to all of them at once and exits when done. Only
+//! contacts and your own devices are visible on the LAN unless both sides
+//! run with `--discover-all` (testing only; it announces this device readably
+//! to everyone on the network).
 //! `pair` asks the person with CODE to become contacts; `link` asks the
 //! device with CODE to share its identity with this one (printing the number
 //! to compare). Both exit once answered.
+//!
+//! `sign-release` writes `neo.exe.sig` next to the exe for a GitHub release,
+//! with the release key in `%APPDATA%\Neo-release\release.key` (created on
+//! first use; keep it private and out of the repo). It prints the public key,
+//! which must match `update::RELEASE_KEY` in the app.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,12 +29,43 @@ use std::time::Instant;
 
 use neo_core::{Command, Config, Direction, Event, TransferState};
 
+fn sign_release(args: Vec<String>) -> anyhow::Result<()> {
+    let mut key = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default().join("Neo-release").join("release.key");
+    let mut exe = None;
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--key" => key = it.next().map(PathBuf::from).unwrap_or(key),
+            _ => exe = Some(PathBuf::from(a)),
+        }
+    }
+    let exe = exe.ok_or_else(|| anyhow::anyhow!("usage: neo-cli sign-release [--key FILE] neo.exe"))?;
+    let new_key = !key.exists();
+    let (sig, public) = neo_core::update::sign(&exe, &key)?;
+    let mut out = exe.clone().into_os_string();
+    out.push(".sig");
+    std::fs::write(&out, &sig)?;
+    let hex: String = public.iter().map(|b| format!("{b:02x}")).collect();
+    if new_key {
+        println!("Created a new release key at {} (keep it private, back it up, never commit it).", key.display());
+    }
+    println!("Signed {} -> {}", exe.display(), PathBuf::from(&out).display());
+    println!("Public key: {hex}");
+    if hex != neo_core::update::RELEASE_KEY {
+        println!("WARNING: this isn't the key built into the app (update::RELEASE_KEY); installed copies would refuse this release.");
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_default();
+    if mode == "sign-release" {
+        return sign_release(args.collect());
+    }
     let (mut profile, mut downloads, mut peers_wanted, mut exit_after, mut person) = (None, None, 1usize, 0usize, None);
     let mut rest = Vec::new();
-    let (mut no_lan, mut no_private) = (false, false);
+    let (mut no_lan, mut no_private, mut discover_all) = (false, false, false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--profile" => profile = args.next(),
@@ -35,6 +75,7 @@ fn main() -> anyhow::Result<()> {
             "--person" => person = args.next(),
             "--no-lan" => no_lan = true,
             "--no-private" => no_private = true,
+            "--discover-all" => discover_all = true,
             _ => rest.push(a),
         }
     }
@@ -50,6 +91,8 @@ fn main() -> anyhow::Result<()> {
         config.person_name = p;
     }
     config.auto_accept = mode == "receive";
+    config.check_updates = false;
+    config.discover_all = discover_all;
     config.lan_discovery = !no_lan;
     config.publish_lan = !no_private;
     let paths: Vec<PathBuf> = rest.iter().map(PathBuf::from).collect();
